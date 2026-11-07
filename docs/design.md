@@ -232,3 +232,35 @@ When live is on, every successful re-bake pushes changed outputs (a worker threa
 - `safety`: `{ "max_flashes_per_s": 3, "min_swing": 0.1, "outputs": "auto" }`. `check` fails a light/emissive output
   that flashes faster than allowed (photosensitivity: a dome fills the whole field of view). The `flash_limit` op
   enforces the limit causally.
+
+## v0.3 contract additions
+
+### Output blend (`replace` | `multiply` | `add`)
+`output.blend` defaults to `"replace"` (v0.2 behaviour). With `"multiply"`, the baked values are **gains**
+(`min + v·(max−min)`, e.g. 0.6..1.55); with `"add"` they are **offsets**. Either way they apply on top of the target's
+existing animation in the sequence (its "base"):
+- **Base:** the first non-beatrig section that already drives that target in the sequence (e.g. the show's own MPC
+  parameter keys, a light's intensity track). If none exists, the base is the target's current static value, read at
+  apply time and recorded.
+- **Applier:**
+  - Evaluate the base at every frame of the bake range.
+  - Compute `final = base × gain` (or `base + offset`).
+  - Simplify with the same relative-tolerance RDP (pure function in `ue/keys.py`).
+  - Write the result on the beatrig-tagged track.
+  - Set the base section **inactive**: it is kept intact and recorded in the beatrig tag, so it's never destroyed.
+  - `undo` deletes the beatrig track and reactivates the base.
+  - `apply` again re-reads the (inactive) base, so editing the base and re-applying works.
+  - `check` recomputes base × gain from the inactive base and compares key-for-key.
+- **bake.json** carries `"blend"` per output. Values stay gains or offsets; the base is never baked offline (it lives in
+  the sequence).
+- `check` (engine): `multiply` needs `min`/`max` meaning a gain range; `add` an offset range. Colour outputs multiply
+  per component.
+
+### Engine additions (v0.3)
+- `beats` op: `min_confidence` (0..1) and `velocity: "strength" | "confidence"`; `notes init --from beats --min-conf X`.
+- `flash_limit`: `mode: "first" | "strongest"`. `strongest` picks the strongest of hits that are too close together,
+  and never moves a hit earlier.
+- `rig.cache_dir`: where the analysis cache lives (relative to the rig). Scene rigs cut from one show mix share one
+  analysis.
+- Timeline import records each clip's `source_in_s` and adjacent transitions, sets `audio_offset_frames` = source in,
+  and offers `--handles N` (frames of media baked before and after each clip, as the dissolves need).
