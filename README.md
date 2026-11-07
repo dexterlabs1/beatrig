@@ -238,7 +238,7 @@ at runtime from tick time can't promise that.
 
 ## Status
 
-v0.2.0. The test suite (100 tests) passes on Windows with Python 3.14; CI runs it on Ubuntu and Windows with Python
+v0.2.0. The test suite (102 tests) passes on Windows with Python 3.14; CI runs it on Ubuntu and Windows with Python
 3.11 and 3.12. The CLI, preview page, MCP server and live link have been run by hand on Windows against UE 5.8.3.
 
 | Part | Status |
