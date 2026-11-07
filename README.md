@@ -206,8 +206,8 @@ keep it on localhost.
 
 ## Status
 
-v0.1.0, not yet tagged. So far everything has been run on **Windows only**, with Python 3.14 and 3.11. The CI workflow
-(Ubuntu and Windows, Python 3.11 and 3.12) is set up but hasn't run yet.
+v0.1.0. The test suite passes in CI on Ubuntu and Windows with Python 3.11 and 3.12; the CLI, preview page and MCP
+server have been run by hand on Windows.
 
 | Part | Status |
 |---|---|
@@ -219,7 +219,8 @@ v0.1.0, not yet tagged. So far everything has been run on **Windows only**, with
 | `ue/beatrig_apply.py` (the in-editor applier) | **Untested.** Written against the UE 5.8 Python API; not yet run in an editor |
 | `ue_apply` / `ue_check` / `ue_undo` over Remote Control | **Untested** against a live editor (only the "no editor running" error path has run) |
 | Niagara targets | **Untested**, and may need a newer editor Python API; drive Niagara from an `mpc` target if it fails |
-| Linux, macOS | Not tried yet (Linux is covered by CI once it runs) |
+| Linux | Test suite passes in CI; CLI, page and MCP server not tried by hand |
+| macOS | Not tried yet |
 
 ## Roadmap
 
