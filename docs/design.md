@@ -157,3 +157,67 @@ exactly what it wrote. It covers MPC scalar/vector params (MovieScene MPC track;
 ## Later (not v0)
 Stems (Demucs, CPU, opt-in), layouts (spawn/arrange actor rings and grids in UE), live MIDI/OSC, DMX out, sending a
 preview to a running editor over Remote Control.
+
+## v0.2 contract additions (all three workstreams code against this)
+
+### Scene scan (`scene.json`, written by `ue_scan` / `beatrig scan`)
+```jsonc
+{ "version": 1, "source": "unreal", "level": "/Game/Maps/L_Show", "units": "cm",
+  "actors": { "Light_0": { "class": "PointLight", "location": [x, y, z], "rotation": [pitch, yaw, roll],
+                           "components": [ { "name": "LightComponent0", "class": "PointLightComponent", "kind": "light" },
+                                           { "name": "StaticMeshComponent0", "class": "StaticMeshComponent", "kind": "mesh",
+                                             "materials": [ { "slot": 0, "scalars": ["Glow"], "vectors": ["Color"] } ] } ] } },
+  "mpcs": { "/Game/FX/MPC_Show": { "scalars": ["Glow"], "vectors": ["Tint"] } },
+  "sequences": ["/Game/Show/LS_Main"],
+  "camera": { "actor": "Dome_Cam", "location": [x, y, z], "rotation": [pitch, yaw, roll], "projection": "domemaster", "dome_angle": 180 } }
+```
+A rig points at it with `"scene": "scene.json"` (optional). `check` then warns about unknown actors, parameters or MPCs.
+
+### Groups
+`rig.groups = { "ring": ["Light_0", ... ] }`. Anywhere an actor list is accepted (outputs, spatial ops), `"@ring"` expands to the group.
+
+### Colour signals
+- `Signal.kind = "color"`: values are `float32[channels, frames, 4]` (linear RGBA).
+- Ops that take colour: `gradient` (value → colour via stops `[[t, [r,g,b,a]], ...]`, or a named palette), `palette_cycle`
+  (colour drifts through a palette, period in beats or seconds, eased), `mix_color`, `scale_color` (brightness × value).
+  Value ops reject colour inputs unless they declare support (`check` error).
+- Colour outputs: target kinds `mpc` (vector param), `light` (property `color`), `material` (vector param) with
+  `"value_type": "color"`. No min/max for colour outputs; intensity scaling happens in the graph.
+- bake.json colour channel: `values: [[r,g,b,a], ...]` per frame, `keys: [[frame, r, g, b, a], ...]`. RDP runs on the
+  4-vector, and the tolerance is relative to the channel's max component range.
+
+### Transform outputs
+- `target = { kind: "transform", actors, property: location|rotation|scale, axis: x|y|z (rotation: roll|pitch|yaw), additive: true }`.
+- With `additive: true` (the default), the applier writes an **additive-blend** 3D transform section. The baked value is an
+  offset on top of the actor's own animation. min/max are in cm, degrees or scale units.
+- The `accumulate` op (running sum of value × rate per frame; causal) gives continuous spin or phase.
+
+### Live link (engine → editor)
+- `beatrig.live.Link(host)` keeps a persistent Remote Control session. The applier is imported once in the editor as a module
+  (no file exec per call).
+- `push(bake, sequence, only_changed=True)` re-writes only the outputs whose content hash changed since the last push and
+  returns `{pushed, skipped, ms}`. `scan()` returns the `scene.json` dict.
+- `playhead_get()` and `playhead_set(frame, playing)` work on the sequence open in Sequencer.
+
+### Server endpoints added (page ↔ live)
+`POST /api/live {enabled, sequence}`, `GET /api/live` (status, last push ms), `POST /api/playhead {frame, playing}`,
+`GET /api/playhead` (editor time, for following the editor), `POST /api/scan` (refresh scene.json from the editor).
+When live is on, every successful re-bake pushes changed outputs.
+
+### notes.json additions (v0.2)
+```jsonc
+{ "sections": [ { "name": "intro", "time": 0.0 }, { "name": "breakdown", "time": 15.27 } ],   // ordered; auto from analysis, editable
+  "patterns": { "kick4": { "length_beats": 4, "hits": [ { "beat": 0, "vel": 1 }, { "beat": 1.5, "vel": 0.7 } ] } },
+  "tracks": { "kick": [ { "time": 1.234, "vel": 0.9 },
+                        { "pattern": "kick4", "at_beat": 16, "repeat": 4 } ] } }        // linked loop: edit the pattern, every copy follows
+```
+- Pattern hits are in beats relative to `at_beat`, which counts on the notes' bpm map. They expand at load time, and
+  expanded hits carry `from_pattern` so editors can show them linked.
+- Layer keys may name a section instead of a frame: `{ "section": "breakdown", "value": 0, "ease": "in_out", "fade_frames": 30 }`.
+
+### Rig additions (v0.2)
+- `audio_in_s` / `audio_out_s`: a window into a long file (e.g. one scene's slot inside a full show mix). Frame 0 = `audio_in_s`.
+- `channel_weights`: per audio channel, e.g. 5.1 `[1, 1, 1, 0.5, 0.7, 0.7]` (L R C LFE Ls Rs). Default is an equal downmix.
+- `safety`: `{ "max_flashes_per_s": 3, "min_swing": 0.1, "outputs": "auto" }`. `check` fails a light/emissive output
+  that flashes faster than allowed (photosensitivity: a dome fills the whole field of view). The `flash_limit` op
+  enforces the limit causally.
