@@ -46,7 +46,11 @@ def parse_fcpxml(text):
         raise TimelineError(f"not valid XML: {e}") from None
     formats = {f.get("id"): f for f in root.iter("format")}
     assets = {a.get("id"): a for a in root.iter("asset")}
-    seq = next(root.iter("sequence"), None)
+    # the edit itself is <library>/<event>/<project>/<sequence>; a compound clip's <sequence> lives in <resources>/<media>
+    # and may come first in the document, so prefer a project's sequence and only then fall back to the first one
+    seq = next((p_.find("sequence") for p_ in root.iter("project") if p_.find("sequence") is not None), None)
+    if seq is None:
+        seq = next(root.iter("sequence"), None)
     if seq is None:
         raise TimelineError("no <sequence> in the FCPXML")
     fmt = formats.get(seq.get("format"))

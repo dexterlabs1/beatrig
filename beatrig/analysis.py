@@ -126,7 +126,9 @@ def at_frames(env, step_ms, frames, fps, offset=0, t0=0.0):
 
 def time_to_frame(t, fps, offset=0, t0=0.0):
     """first sequence frame whose start is at or after audio time t (t0 = audio time of frame `offset`)"""
-    return (np.ceil(np.round((np.asarray(t, np.float64) - float(t0)) * fps, 6)).astype(np.int64) + int(offset))
+    # round to 1e-4 frame before ceil: notes store times to 1 us, so a hit saved exactly on a frame start must not slip a
+    # frame late; 1e-4 frame (3 us at 30 fps) is far below anything audible or visible
+    return (np.ceil(np.round((np.asarray(t, np.float64) - float(t0)) * fps, 4)).astype(np.int64) + int(offset))
 
 
 def norm_db(v, range_db, hi_pct=99.5, lo_pct=10):

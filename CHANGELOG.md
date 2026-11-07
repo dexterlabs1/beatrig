@@ -54,6 +54,10 @@ Live editing in Unreal, colour, spatial waves across real scene layouts, flash s
 - `undo` now removes the bindings beatrig created (and only those).
 - Binding de-duplication: UE Python's `str(Guid)` includes a memory address; beatrig uses `Guid.to_string()`.
 - MCP `list_ops` failed to serialise ops whose kind follows their input.
+- FCPXML import read a compound clip's `<sequence>` (in `<resources>`) instead of the project's edit when the compound
+  came first in the file; it now prefers `<project>/<sequence>`.
+- A hit saved exactly on a frame start could land one frame late after a round trip through `notes.json` (times are
+  stored to 1 microsecond); frame placement now rounds to 1e-4 of a frame first.
 
 ## [0.1.0] - 2026-11-07
 

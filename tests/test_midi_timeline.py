@@ -194,6 +194,23 @@ def test_fcpxml_and_edl_parsing():
     assert e30["clips"][0]["start_s"] == 10.0
 
 
+def test_fcpxml_prefers_the_project_sequence_over_a_compound_clip():
+    # a compound clip's <sequence> sits in <resources> and comes first in the document; the edit is the project's
+    compound = FCPXML.replace("<resources>", """<resources>
+    <media id="m1" name="Compound Clip 1"><sequence format="r1" duration="2400/24s"><spine>
+      <asset-clip ref="a1" name="Inside compound" offset="0s" duration="2400/24s"/></spine></sequence></media>""", 1)
+    assert compound != FCPXML
+    tl = parse_fcpxml(compound)
+    assert [c["name"] for c in tl["clips"]] == ["Scene A", "Scene B"]
+
+
+def test_time_to_frame_survives_microsecond_storage():
+    from beatrig.analysis import time_to_frame
+    for f in range(1, 400):
+        t = round(f / 30.0, 6)                      # what notes.json stores for a hit exactly on frame f's start
+        assert int(time_to_frame(t, 30)) == f
+
+
 def test_timeline_import_cli_writes_window_rigs():
     d = tmpdir()
     write_clicks(os.path.join(d, "mix.wav"), click_times(24.0), 24.0)
