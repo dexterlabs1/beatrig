@@ -4,7 +4,7 @@
 
 beatrig analyses a song offline, runs it through a small JSON motion graph, and bakes the result into plain keyframes
 (per-frame values plus a simplified set of linear keys) for lights, material parameters, material parameter collections
-and Niagara parameters. The same inputs always give a byte-identical bake, so a render matches the preview every time. Timing is
+and Niagara parameters. The same inputs give a byte-identical bake (tested run to run on one machine), so a render matches the preview. Timing is
 causal: nothing moves before its sound (ITU-R BT.1359), and continuous motion is eased, so only real hits snap. The output is
 ordinary Sequencer keys, so nothing has to be installed at render time and there is no resolution cap. Every step can
 be driven by an agent as well as by a person: there's a CLI, the files are hand-editable JSON, and an MCP server
