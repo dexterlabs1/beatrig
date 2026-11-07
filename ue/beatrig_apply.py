@@ -131,15 +131,23 @@ def _linearise(section):
 
 def _add_frame_keys(channel, keys):
     for f, v in keys:
-        channel.add_key(unreal.FrameNumber(int(f)), float(v), 0.0, unreal.SequenceTimeUnit.DISPLAY_RATE,
+        channel.add_key(unreal.FrameNumber(int(f)), float(v), 0.0, unreal.MovieSceneTimeUnit.DISPLAY_RATE,
                         unreal.MovieSceneKeyInterpolation.LINEAR)
 
 
 def _add_tick_scalar_keys(section, param, keys):
     """GOTCHA: add_scalar_parameter_key takes TICK time, not display frames (keys.py does the conversion)"""
     name = unreal.Name(param)
+    lin = unreal.MovieSceneKeyInterpolation.LINEAR
+    if isinstance(section, getattr(unreal, "MovieSceneComponentMaterialParameterSection", ())):
+        # UE 5.4+: component material sections key by MaterialParameterInfo (+ material layer / asset names)
+        info = unreal.MaterialParameterInfo()
+        info.set_editor_property("name", name)
+        for t, v in keys:
+            section.add_scalar_parameter_key(info, unreal.FrameNumber(int(t)), float(v), "", "", lin)
+        return
     for t, v in keys:
-        section.add_scalar_parameter_key(name, unreal.FrameNumber(int(t)), float(v))
+        section.add_scalar_parameter_key(name, unreal.FrameNumber(int(t)), float(v), lin)
 
 
 def _new_section(track, rng):
@@ -179,12 +187,13 @@ def _write(seq, plan, actors):
         b = _component_binding(seq, actor, comp)
         track = b.add_track(unreal.MovieSceneComponentMaterialTrack)
         idx = plan["material_index"]
-        try:
-            track.set_editor_property("material_index", idx)
-        except Exception:
-            info = track.get_editor_property("material_info")          # 5.3+: ComponentMaterialInfo
+        if hasattr(track, "set_material_info"):                             # UE 5.3+: ComponentMaterialInfo
+            info = unreal.ComponentMaterialInfo()
             info.set_editor_property("material_slot_index", idx)
-            track.set_editor_property("material_info", info)
+            info.set_editor_property("material_type", unreal.ComponentMaterialType.INDEXED_MATERIAL)
+            track.set_material_info(info)
+        else:                                                               # older engines
+            track.set_material_index(idx)
         _set_name(track, plan["tag"])
         sec = _new_section(track, plan["range"])
         _add_tick_scalar_keys(sec, plan["param"], plan["keys"])

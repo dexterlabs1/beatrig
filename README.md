@@ -216,8 +216,8 @@ server have been run by hand on Windows.
 | Preview page | Checked by hand in a browser |
 | MCP server | Run end to end over stdio with the MCP Python SDK client (list tools, analyze, describe_audio, rig and notes edits, bake, plot, preview notify); no automated test yet |
 | `ue/keys.py` (tick maths, key planning, undo tags) | Tested: pytest |
-| `ue/beatrig_apply.py` (the in-editor applier) | **Untested.** Written against the UE 5.8 Python API; not yet run in an editor |
-| `ue_apply` / `ue_check` / `ue_undo` over Remote Control | **Untested** against a live editor (only the "no editor running" error path has run) |
+| `ue/beatrig_apply.py` (the in-editor applier) | Tested by hand in UE 5.8.3: `light`, `material` and `mpc` targets apply, read back key-for-key (`check`), re-apply in place and `undo` cleanly. Undo leaves the (empty) actor bindings in the sequence |
+| `ue_apply` / `ue_check` / `ue_undo` over Remote Control | Tested by hand against UE 5.8.3 (17 tracks, about 6,000 keys) |
 | Niagara targets | **Untested**, and may need a newer editor Python API; drive Niagara from an `mpc` target if it fails |
 | Linux | Test suite passes in CI; CLI, page and MCP server not tried by hand |
 | macOS | Not tried yet |
