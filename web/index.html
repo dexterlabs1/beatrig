@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>beatrig</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header id="transport">
+  <button id="play" class="icon" title="Play / pause (Space)" aria-label="Play">
+    <svg viewBox="0 0 16 16" width="14" height="14"><path id="play-glyph" d="M4 2.5v11l9-5.5z"/></svg>
+  </button>
+  <div class="readout wide" title="Audio time"><span id="t-sec">0.000</span><small>s</small></div>
+  <div class="readout" title="Sequence frame"><span id="t-frame">0</span><small>f</small></div>
+  <div class="readout" title="Bar . beat . sixteenth"><span id="t-beat">1.1.1</span></div>
+  <div class="readout" title="Tempo (notes.json bpm map)"><span id="bpm">-</span><small>bpm</small></div>
+  <div class="readout" title="Frame rate"><span id="fps">-</span><small>fps</small></div>
+  <span class="sep"></span>
+  <span class="lbl">Zoom</span>
+  <button id="zoom-out" class="icon" title="Zoom out (Ctrl+wheel)">&minus;</button>
+  <input id="zoom" type="range" min="0" max="1000" value="0" title="Zoom">
+  <button id="zoom-in" class="icon" title="Zoom in (Ctrl+wheel)">+</button>
+  <button id="zoom-fit" title="Fit the whole clip">Fit</button>
+  <span class="sep"></span>
+  <label class="chk" title="Snap note edits to the grid"><input id="snap" type="checkbox" checked> Snap</label>
+  <select id="grid" title="Grid size in beats">
+    <option value="1">1 beat</option>
+    <option value="0.5">1/2 beat</option>
+    <option value="0.25" selected>1/4 beat</option>
+    <option value="0.125">1/8 beat</option>
+    <option value="0.0625">1/16 beat</option>
+  </select>
+  <label class="chk" title="Page the view with the playhead"><input id="follow" type="checkbox" checked> Follow</label>
+  <span class="spacer"></span>
+  <span id="bake-info" class="dim">-</span>
+  <span id="dirty" class="dirty" hidden>Unsaved</span>
+  <button id="save" title="Write rig.json and notes.json (Ctrl+S)" disabled>Save</button>
+</header>
+
+<main id="timeline">
+  <div id="lanes">
+    <div id="lanes-top">
+      <div class="lane ruler"><div class="lane-head"><span class="dim">Time</span></div><canvas data-kind="ruler"></canvas></div>
+      <div class="lane wave"><div class="lane-head"><span>Audio</span><small id="audio-name" class="dim"></small></div><canvas data-kind="wave"></canvas></div>
+      <div id="band-lanes"></div>
+    </div>
+    <div class="group-head">Notes <small class="dim">click to add, drag to move, drag up/down for velocity, Delete removes</small></div>
+    <div id="note-lanes"></div>
+    <div class="group-head">Outputs</div>
+    <div id="curve-lanes"></div>
+    <div id="playhead"></div>
+  </div>
+</main>
+
+<aside id="side">
+  <section id="schem">
+    <h2>Preview <small id="schem-frame" class="dim"></small></h2>
+    <canvas id="schem-canvas"></canvas>
+  </section>
+  <section id="params">
+    <h2>Parameters <small class="dim">release a slider to re-bake</small></h2>
+    <div id="param-error" class="err" hidden></div>
+    <div id="param-list"></div>
+  </section>
+  <section id="agent">
+    <h2>Agent activity <small id="agent-rev" class="dim"></small></h2>
+    <ol id="agent-list"><li class="dim">No agent activity yet</li></ol>
+  </section>
+</aside>
+
+<footer id="status">
+  <span id="engine" class="dim"></span>
+  <span id="paths" class="dim"></span>
+  <span class="spacer"></span>
+  <span id="msg"></span>
+</footer>
+
+<audio id="audio" src="/api/audio" preload="auto"></audio>
+<script src="app.js"></script>
+</body>
+</html>

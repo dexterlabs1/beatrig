@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# beatrig outputs and caches (regenerated from rig.json + audio)
+analysis.json
+analysis.npz
+analysis.npz.tmp
+bake.json
+*.bak
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# internal / generated
+TASKS.md
+web/dev/loop.wav
+web/dev/analysis.*
+web/dev/bake.json

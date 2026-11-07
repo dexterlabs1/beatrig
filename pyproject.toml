@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "beatrig"
+version = "0.1.0"
+description = "A reactive engine for agents and artists: music in, deterministic animation keys out."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Dexter Brewer" }]
+requires-python = ">=3.10"
+keywords = ["audio", "music", "animation", "unreal", "sequencer", "mcp", "beat-detection", "motion-graphics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+beatrig = "beatrig.cli:main"
+beatrig-mcp = "beatrig.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/dexterlabs1/beatrig"
+Issues = "https://github.com/dexterlabs1/beatrig/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["beatrig"]
+exclude = ["web/dev", "**/*.wav", "**/analysis.*", "**/bake.json"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"web/index.html" = "beatrig/_web/index.html"
+"web/app.css" = "beatrig/_web/app.css"
+"web/app.js" = "beatrig/_web/app.js"
+"ue" = "beatrig/_ue"
+
+[tool.hatch.build.targets.sdist]
+include = ["beatrig", "web", "ue", "examples", "tests", "docs", "README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTING.md"]
+exclude = ["**/*.wav", "**/analysis.*", "**/bake.json", "**/*.bak", "TASKS.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

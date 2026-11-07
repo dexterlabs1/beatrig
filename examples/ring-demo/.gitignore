@@ -1,0 +1,5 @@
+audio/
+analysis.json
+analysis.npz
+bake.json
+*.bak

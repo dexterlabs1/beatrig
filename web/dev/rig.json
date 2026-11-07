@@ -1,0 +1,123 @@
+{
+  "audio": "loop.wav",
+  "fps": 30,
+  "frames": null,
+  "audio_offset_frames": 0,
+  "tempo": {
+    "bpm": null,
+    "map": []
+  },
+  "seed": 1,
+  "notes": "notes.json",
+  "nodes": [
+    {
+      "id": "kick",
+      "op": "band",
+      "lo": 40,
+      "hi": 120
+    },
+    {
+      "id": "kickN",
+      "op": "normalize",
+      "in": "kick",
+      "range_db": 24
+    },
+    {
+      "id": "kickS",
+      "op": "smooth",
+      "in": "kickN",
+      "attack_ms": 15,
+      "release_ms": 220
+    },
+    {
+      "id": "hits",
+      "op": "notes",
+      "track": "kick"
+    },
+    {
+      "id": "pulse",
+      "op": "envelope",
+      "in": "hits",
+      "shape": "punch",
+      "length_beats": 0.5
+    },
+    {
+      "id": "ring",
+      "op": "chase",
+      "in": "pulse",
+      "channels": 8,
+      "step_beats": 0.125
+    },
+    {
+      "id": "hat",
+      "op": "notes",
+      "track": "hat"
+    },
+    {
+      "id": "hatE",
+      "op": "envelope",
+      "in": "hat",
+      "shape": "razor",
+      "length_beats": 0.25
+    }
+  ],
+  "layers": [
+    {
+      "id": "main",
+      "intensity": [
+        {
+          "frame": 0,
+          "value": 1
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "id": "lights",
+      "layer": "main",
+      "signal": "ring",
+      "target": {
+        "kind": "light",
+        "actors": [
+          "Light_0",
+          "Light_1",
+          "Light_2",
+          "Light_3",
+          "Light_4",
+          "Light_5",
+          "Light_6",
+          "Light_7"
+        ],
+        "property": "intensity"
+      },
+      "min": 500,
+      "max": 20000
+    },
+    {
+      "id": "glow",
+      "signal": "kickS",
+      "target": {
+        "kind": "mpc",
+        "asset": "/Game/Demo/MPC_Demo",
+        "param": "Glow"
+      },
+      "min": 0.2,
+      "max": 3
+    },
+    {
+      "id": "strobe",
+      "signal": "hatE",
+      "target": {
+        "kind": "mpc",
+        "asset": "/Game/Demo/MPC_Demo",
+        "param": "Strobe"
+      },
+      "min": 0,
+      "max": 1
+    }
+  ],
+  "bake": {
+    "key_tolerance": 0.002
+  }
+}

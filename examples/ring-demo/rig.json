@@ -1,0 +1,42 @@
+{
+ "description": "8-light ring: kick-driven punch chase on the lights, a smoothed global glow, a beat-locked LFO wave on the orbs, and a two-layer crossfade into the breakdown (frame 450) and back (frame 645).",
+ "audio": "audio/demo_110bpm.wav",
+ "fps": 30,
+ "frames": null,
+ "audio_offset_frames": 0,
+ "tempo": { "bpm": null, "map": [] },
+ "seed": 1,
+ "nodes": [
+  { "id": "kick",    "op": "band", "lo": 40, "hi": 120 },
+  { "id": "kickOn",  "op": "onsets", "in": "kick", "threshold": 0.3, "min_gap_ms": 150 },
+  { "id": "kickN",   "op": "normalize", "in": "kick", "range_db": 24 },
+  { "id": "kickS",   "op": "smooth", "in": "kickN", "attack_ms": 15, "release_ms": 220 },
+  { "id": "hits",    "op": "notes", "track": "kick" },
+  { "id": "pulse",   "op": "envelope", "in": "hits", "shape": "punch", "length_beats": 0.5 },
+  { "id": "ring",    "op": "chase", "in": "pulse", "channels": 8, "step_beats": 0.125 },
+  { "id": "loud",    "op": "loudness", "attack_ms": 30, "release_ms": 400 },
+  { "id": "loudN",   "op": "normalize", "in": "loud", "range_db": 30 },
+  { "id": "glow",    "op": "smooth", "in": "loudN", "attack_ms": 150, "release_ms": 600 },
+  { "id": "wave",    "op": "lfo", "shape": "sine", "rate_beats": 4, "channels": 8, "phase_step": 0.125 },
+  { "id": "orbs",    "op": "math", "fn": "mul", "in": ["wave", "glow"] }
+ ],
+ "layers": [
+  { "id": "chase", "intensity": [ { "frame": 0, "value": 1 },
+                                  { "frame": 450, "value": 0, "ease": "in_out", "fade_frames": 30 },
+                                  { "frame": 645, "value": 1, "ease": "in_out", "fade_frames": 15 } ] },
+  { "id": "wave",  "intensity": [ { "frame": 0, "value": 0 },
+                                  { "frame": 450, "value": 1, "ease": "in_out", "fade_frames": 30 },
+                                  { "frame": 645, "value": 0, "ease": "in_out", "fade_frames": 15 } ] }
+ ],
+ "outputs": [
+  { "id": "lights", "layer": "chase", "signal": "ring",
+    "target": { "kind": "light", "actors": ["Light_0", "Light_1", "Light_2", "Light_3", "Light_4", "Light_5", "Light_6", "Light_7"], "property": "intensity" },
+    "min": 500, "max": 20000 },
+  { "id": "orbs", "layer": "wave", "signal": "orbs",
+    "target": { "kind": "material", "actors": ["Orb_0", "Orb_1", "Orb_2", "Orb_3", "Orb_4", "Orb_5", "Orb_6", "Orb_7"], "param": "Glow" },
+    "min": 0, "max": 5 },
+  { "id": "glow", "signal": "glow",
+    "target": { "kind": "mpc", "asset": "/Game/Beatrig/MPC_Demo", "param": "Glow" }, "min": 0.2, "max": 3 }
+ ],
+ "bake": { "key_tolerance": 0.002 }
+}
