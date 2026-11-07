@@ -23,7 +23,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 import zlib
@@ -32,7 +31,6 @@ import numpy as np
 
 PREVIEW_URL = os.environ.get("BEATRIG_PREVIEW_URL", "http://127.0.0.1:4700")
 UE_HOST = os.environ.get("BEATRIG_UE_HOST", "127.0.0.1:30010")
-UE_RESULT = "BEATRIG_RESULT "
 
 # Candidate frequency ranges for analyze/describe_audio. These are ranges where a kind of sound usually sits, not
 # detected instruments: the score says how clearly a range carries separate hits in THIS song.
@@ -349,7 +347,7 @@ def list_ops() -> str:
     from . import ops
     out = {}
     for name, s in sorted(ops.SPECS.items()):
-        out[name] = {"inputs": s.inputs, "kind": s.kind,
+        out[name] = {"inputs": s.inputs, "kind": s.kind if isinstance(s.kind, str) else "same as input",
                      "params": {k: ("REQUIRED" if v is ops.REQ else v) for k, v in s.params.items()}}
         if s.one_of:
             out[name]["one_of"] = [list(g) if isinstance(g, (list, tuple)) else g for g in s.one_of]
@@ -743,6 +741,8 @@ def _hex(c):
 
 C_BG, C_LANE, C_GRID, C_BAR, C_WAVE = _hex("#FAFAF7"), _hex("#F0F1F4"), _hex("#E2E4E9"), _hex("#C3C8D1"), _hex("#9AA1AD")
 C_FILL, C_CURVE, C_HIT, C_KEY, C_TEXT = _hex("#D6E2F5"), _hex("#1F5FBF"), _hex("#E8590C"), _hex("#0B2E66"), _hex("#2B2F36")
+C_FLASH = _hex("#C92A2A")
+LUMA = np.array([0.2126, 0.7152, 0.0722])                       # Rec. 709 luminance of linear RGB (colour outputs)
 
 
 def _time_step(span):
@@ -758,9 +758,10 @@ def _fmt_t(t):
     return f"{t:g}s"
 
 
-def render_plot(output, hits, keys_on, peaks, peaks_per_s, beats, fps, offset, t0, t1, width=1200):
+def render_plot(output, hits, keys_on, peaks, peaks_per_s, beats, fps, offset, t0, t1, width=1200, flash=None):
     """Draw one bake output: waveform lane on top, then one lane per channel with the value curve (filled), hits as
-    orange ticks, keys as dark dots, beat lines through every lane. Returns PNG bytes."""
+    orange ticks, keys as dark dots, beat lines through every lane. flash: per channel, [[s0, s1], ...] spans (bake
+    seconds) that break the flash-safety limit, drawn as a red bar along the top of the lane. Returns PNG bytes."""
     chans = output["channels"]
     n = len(chans)
     lane_h = int(np.clip(480 // max(n, 1), 36, 110))
@@ -835,6 +836,11 @@ def render_plot(output, hits, keys_on, peaks, peaks_per_s, beats, fps, offset, t
                 x = x_of(t)
                 img[y + h - 7:y + h, max(x - 1, left):x + 1] = C_HIT
                 img[y:y + h - 7:3, x] = C_HIT
+        # flash-safety violations: a red bar along the lane top
+        for s0, s1 in (flash[i] if flash and i < len(flash) else []):
+            a0, a1 = max(s0 - offset / fps, t0), min(s1 - offset / fps, t1)
+            if a1 > a0:
+                img[y:y + 4, x_of(a0):max(x_of(a1), x_of(a0) + 1)] = C_FLASH
         label = ch.get("actor") or output.get("target", {}).get("param") or output["id"]
         _text(img, 6, y + 4, str(label)[:15], C_TEXT)
         _text(img, 6, y + h - 9, f"{lo:g}-{hi:g}"[:15], C_WAVE)
@@ -848,7 +854,7 @@ def render_plot(output, hits, keys_on, peaks, peaks_per_s, beats, fps, offset, t
         t += st
     tgt = output.get("target", {})
     title = (f"{output['id']}  {tgt.get('kind', '')}  {t0:.2f}-{t1:.2f}s  {n} ch   "
-             f"grey=audio  lines=beats  orange=hits  blue=value  dots=keys")
+             f"grey=audio  lines=beats  orange=hits  blue=value  dots=keys" + ("  red=flash limit" if flash else ""))
     _text(img, 6, 8, title[: (W - 12) // 6], C_TEXT)
     return _png(img)
 
@@ -866,6 +872,9 @@ def _plot_data(rig_path, output_id, start_s, end_s, channels):
         idx = [names.index(c) if isinstance(c, str) and c in names else int(c) for c in channels]
     idx = idx[:16]
     o = dict(o, channels=[o["channels"][i] for i in idx])
+    if o.get("value_type") == "color" or (o["channels"] and o["channels"][0]["values"]
+                                          and isinstance(o["channels"][0]["values"][0], list)):
+        o = _as_luminance(o)
     hits = [s.hits[i] for i in idx]
     fps, off = float(res["fps"]), int(res.get("audio_offset_frames", 0))
     dur = (res["frames"] - off) / fps
@@ -875,13 +884,49 @@ def _plot_data(rig_path, output_id, start_s, end_s, channels):
         raise ToolFailure(f"empty range {t0}-{t1} s (bake covers 0-{dur:.2f} s of audio)")
     peaks = a.arrays["peaks"].astype(np.float64) if a is not None else np.zeros(0)
     beats = [b["time"] for b in a.beats] if a is not None else []
-    return o, hits, peaks, beats, fps, off, t0, t1
+    return o, hits, peaks, beats, fps, off, t0, t1, data
+
+
+def _as_luminance(o):
+    """a colour output drawn as one luminance curve per channel (0..the output's brightest), keys likewise"""
+    chans, top = [], 0.0
+    for c in o["channels"]:
+        lum = np.asarray(c["values"], np.float64)[:, :3] @ LUMA
+        top = max(top, float(lum.max()) if len(lum) else 0.0)
+        keys = [[k[0], float(np.dot(k[1:4], LUMA))] for k in c.get("keys", [])]
+        chans.append(dict(c, values=lum.tolist(), keys=keys))
+    return dict(o, channels=chans, min=0.0, max=top or 1.0, luminance=True)
+
+
+def _flash_safety(rig_data, o, fps):
+    """(per-channel violation spans in bake seconds, caption block) from beatrig.safety.flash_report, or (None, None)
+    when that module isn't installed. Colour outputs are judged on luminance, as the bake check does."""
+    try:
+        from . import safety
+        report = safety.flash_report
+    except (ImportError, AttributeError):
+        return None, None
+    try:
+        s = safety.settings(rig_data)[0] if hasattr(safety, "settings") else {"max_flashes_per_s": 3.0, "min_swing": 0.1}
+        lo, hi = float(o.get("min", 0.0)), float(o.get("max", 1.0))
+        spans, rows = [], []
+        for c in o["channels"]:
+            r = report(c["values"], fps, lo, hi, s["max_flashes_per_s"], s["min_swing"])
+            spans.append(r.get("windows") or [])
+            rows.append({"actor": c.get("actor"), "ok": r.get("ok"), "max_per_s": r.get("max_per_s"),
+                         "windows_s": (r.get("windows") or [])[:8]})
+        return spans, {"limit_per_s": s["max_flashes_per_s"], "min_swing": s["min_swing"],
+                       "ok": all(x["ok"] for x in rows), "channels": rows}
+    except Exception as e:                                     # an engine change must never break plot
+        return None, {"unavailable": f"{type(e).__name__}: {e}"}
 
 
 def plot_png(rig_path, output_id, start_s=0.0, end_s=None, channels=None, width=1200, keys=True):
     """(png bytes, caption dict); the image the plot tool returns"""
-    o, hits, peaks, beats, fps, off, t0, t1 = _plot_data(rig_path, output_id, start_s, end_s, channels)
-    png = render_plot(o, hits, keys, peaks, 200.0, beats, fps, off, t0, t1, int(np.clip(width, 480, 2400)))
+    o, hits, peaks, beats, fps, off, t0, t1, rig_data = _plot_data(rig_path, output_id, start_s, end_s, channels)
+    spans, safety_cap = _flash_safety(rig_data, o, fps)
+    png = render_plot(o, hits, keys, peaks, 200.0, beats, fps, off, t0, t1, int(np.clip(width, 480, 2400)),
+                      flash=spans if spans and any(spans) else None)
     f0, f1 = int(t0 * fps) + off, int(np.ceil(t1 * fps)) + off
     cap = {"output": o["id"], "range_s": [_r(t0, 2), _r(t1, 2)], "frames": [f0, f1], "channels": []}
     for ch, h in zip(o["channels"], hits):
@@ -891,6 +936,12 @@ def plot_png(rig_path, output_id, start_s=0.0, end_s=None, channels=None, width=
                                 "keys": sum(1 for k in ch["keys"] if f0 <= k[0] < f1)})
     cap["legend"] = "top lane: audio waveform; grey lines: beats (darker = bar); per channel: blue value curve " \
                     "(lane floor = output min, top = max), orange ticks = trigger hits, dark dots = baked keys"
+    if o.get("luminance"):
+        cap["legend"] += "; colour output: curves show luminance (Rec. 709 of linear RGB)"
+    if safety_cap is not None:
+        cap["flash_safety"] = safety_cap
+        if safety_cap.get("channels"):
+            cap["legend"] += "; red bar on a lane top = more flashes per second than the safety limit"
     return png, cap
 
 
@@ -951,118 +1002,148 @@ def preview_start(rig_path: str, port: int = 4700) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ Unreal (Remote Control)
-def _ue_dir():
-    here = os.path.dirname(os.path.abspath(__file__))
-    for d in (os.path.join(os.path.dirname(here), "ue"), os.path.join(here, "_ue")):
-        if os.path.exists(os.path.join(d, "beatrig_apply.py")):
-            return d
-    raise ToolFailure("ue/beatrig_apply.py not found next to the package (install from a clone of the repo)")
+_LINKS = {}
 
 
-def ue_command(args, host=None, timeout=300):
-    """Run ue/beatrig_apply.py with args inside a running editor through Remote Control
-    (PUT /remote/object/call -> PythonScriptLibrary.ExecutePythonCommandEx). Returns the applier's result dict."""
-    host = host or UE_HOST
-    applier = os.path.join(_ue_dir(), "beatrig_apply.py").replace("\\", "/")
-    script = ("import runpy, sys\n"
-              f"sys.argv = {json.dumps([applier] + [str(a) for a in args])}\n"
-              f"runpy.run_path({json.dumps(applier)}, run_name='__main__')\n")
-    fd, tmp = tempfile.mkstemp(prefix="beatrig-ue-", suffix=".py")
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(script)
-    tmp = tmp.replace("\\", "/")
-    body = json.dumps({
-        "objectPath": "/Script/PythonScriptPlugin.Default__PythonScriptLibrary",
-        "functionName": "ExecutePythonCommandEx",
-        "parameters": {"PythonCommand": f'"{tmp}"' if " " in tmp else tmp, "ExecutionMode": "ExecuteFile",
-                       "FileExecutionScope": "Public"},
-        "generateTransaction": False,
-    }).encode()
-    url = f"http://{host}/remote/object/call"
-    req = urllib.request.Request(url, data=body, method="PUT", headers={"Content-Type": "application/json"})
+def _link(host=None):
+    """one persistent beatrig.live.Link per editor host for the life of this server (keep-alive connection, applier
+    imported once, push cache). It leaves the editor's background throttle alone (keep_awake=False)."""
+    from .live import Link
+    key = host or UE_HOST
+    if key not in _LINKS:
+        _LINKS[key] = Link(key, keep_awake=False)
+    return _LINKS[key]
+
+
+def _live(fn, *a, **kw):
+    from .live import LiveError
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            text = r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        hint = (" Remote Control refused the call: allowlist PythonScriptLibrary.ExecutePythonCommandEx and restart "
-                "the editor (see the README's Unreal section)") if e.code in (403, 404) else ""
-        raise ToolFailure(f"Unreal Remote Control at {url} returned HTTP {e.code}.{hint}") from None
-    except (urllib.error.URLError, OSError) as e:
-        raise ToolFailure(f"no Unreal editor answering at {url} ({getattr(e, 'reason', e)}). Open the project with the "
-                          f"Remote Control and Python plugins enabled, or pass host=") from None
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-    try:
-        j = json.loads(text)
-    except json.JSONDecodeError:
-        raise ToolFailure(f"unexpected Remote Control reply: {text[:200]}") from None
-    if j.get("errorMessage"):
-        raise ToolFailure(f"Remote Control: {j['errorMessage']}")
-    lines = [str(e.get("Output", "")) for e in j.get("LogOutput") or []]
-    for line in reversed(lines):
-        if line.startswith(UE_RESULT):
-            return json.loads(line[len(UE_RESULT):])
-    raise ToolFailure("the applier printed no result; editor log tail: " + " | ".join(lines[-6:])[:600])
+        return fn(*a, **kw)
+    except LiveError as e:
+        raise ToolFailure(str(e)) from None
 
 
-def _ue_args(start_frame, only, save):
-    a = []
-    if start_frame:
-        a += ["--start", int(start_frame)]
-    if only:
-        a += ["--only", ",".join(only)]
-    if save:
-        a.append("--save")
-    return a
+def _bake_file(bake_path):
+    bp = os.path.abspath(bake_path)
+    if not os.path.exists(bp):
+        raise ToolFailure(f"bake not found: {bp} (run bake first)")
+    return bp
+
+
+def _ue_result(res, keep=("ok", "sequence", "keys", "replaced", "removed", "errors", "refreshed", "saved", "bindings",
+                          "pushed", "skipped", "calls", "ms", "rt_ms", "editor_ms", "write_ms")):
+    """the editor's result without the per-track list (a count instead)"""
+    out = {k: res[k] for k in keep if k in res}
+    if "written" in res:
+        out["tracks"] = len(res["written"])
+    if isinstance(out.get("bindings"), dict) and isinstance(out["bindings"].get("pruned"), list):
+        out["bindings"] = dict(out["bindings"], pruned=len(out["bindings"]["pruned"]))
+    return out
 
 
 @tool
 def ue_apply(bake_path: str, sequence_path: str, host: str | None = None, start_frame: int = 0,
              only: list | None = None, save: bool = False) -> str:
-    """Write a bake.json into a Level Sequence in a running Unreal editor (via Remote Control on localhost:30010).
+    """Write a bake.json into a Level Sequence in a running Unreal editor (Remote Control on localhost:30010).
     sequence_path is the asset path, e.g. "/Game/Show/LS_Main". Replaces only the tracks beatrig wrote before for these
     outputs (tagged "beatrig:<output id>"). The bake's fps must equal the sequence's display rate. save=true saves the
-    asset. Untested against a live editor so far: run ue_check afterwards."""
-    bp = os.path.abspath(bake_path)
-    if not os.path.exists(bp):
-        raise ToolFailure(f"bake not found: {bp} (run bake first)")
-    res = ue_command(["apply", sequence_path, bp.replace("\\", "/")] + _ue_args(start_frame, only, save), host)
+    asset. Tested on UE 5.8.3; run ue_check afterwards to compare key for key."""
+    res = _live(_link(host).apply, _bake_file(bake_path), sequence_path, only or None, int(start_frame), bool(save))
     _notify("ue_apply", f"{sequence_path}: {res.get('keys', 0)} keys, ok={res.get('ok')}")
-    return _j(res)
+    return _j(_ue_result(res))
 
 
 @tool
 def ue_undo(sequence_path: str, output_id: str | None = None, host: str | None = None, save: bool = False) -> str:
-    """Remove the tracks beatrig wrote into a Level Sequence (all of them, or one output's). Touches nothing else."""
-    args = ["undo", sequence_path] + ([output_id] if output_id else []) + (["--save"] if save else [])
-    res = ue_command(args, host)
+    """Remove the tracks beatrig wrote into a Level Sequence (all of them, or one output's), plus the bindings beatrig
+    created that are now empty. Bindings that were already in the sequence are never removed."""
+    res = _live(_link(host).undo, sequence_path, output_id, bool(save))
     _notify("ue_undo", f"{sequence_path}: removed {len(res.get('removed', []))} track(s)")
-    return _j(res)
+    return _j(_ue_result(res))
 
 
 @tool
 def ue_check(bake_path: str, sequence_path: str, host: str | None = None, start_frame: int = 0,
              only: list | None = None) -> str:
     """Read the keys back from the Level Sequence and compare them with the bake: per track, expected vs actual key
-    counts, missing/extra keys and the largest value error."""
-    bp = os.path.abspath(bake_path)
-    if not os.path.exists(bp):
-        raise ToolFailure(f"bake not found: {bp}")
-    return _j(ue_command(["check", sequence_path, bp.replace("\\", "/")] + _ue_args(start_frame, only, False), host))
+    counts, missing/extra keys and the largest value error (colour tracks: all four channels; Niagara tracks: also the
+    parameter name)."""
+    res = _live(_link(host).check, _bake_file(bake_path), sequence_path, only or None, int(start_frame))
+    bad = [t for t in res.get("tracks", []) if not t.get("ok")]
+    return _j({"ok": res.get("ok"), "sequence": res.get("sequence"), "tracks": len(res.get("tracks", [])),
+               "keys": res.get("keys"), "failed": bad[:20], "rt_ms": res.get("rt_ms")})
+
+
+@tool
+def live_push(bake_path: str, sequence_path: str, only_changed: bool = True, start_frame: int = 0,
+              host: str | None = None) -> str:
+    """Push a bake into a Level Sequence, rewriting only the outputs whose keys changed since this server's last push
+    to that sequence (only_changed=false rewrites all). Outputs pushed before but gone from the bake are removed. If the
+    sequence is open in Sequencer it is re-evaluated, so the viewport shows the change. Returns pushed/skipped/removed
+    output ids and timings (ms)."""
+    res = _live(_link(host).push, _bake_file(bake_path), sequence_path, bool(only_changed), int(start_frame))
+    _notify("live_push", f"{sequence_path}: pushed {res.get('pushed')}, skipped {len(res.get('skipped', []))}")
+    return _j(_ue_result(res, keep=("ok", "pushed", "skipped", "removed", "errors", "keys", "refreshed", "calls", "ms",
+                                    "rt_ms", "editor_ms", "write_ms")))
+
+
+@tool
+def ue_scan(out: str | None = None, rig_path: str | None = None, host: str | None = None,
+            paths: list | None = None) -> str:
+    """Scan the level open in the editor: every actor (class, location, rotation, mobility, components of kind light/
+    mesh/niagara/camera, each mesh's material slots with their scalar/vector parameter names), the MPC assets with
+    their parameters, the Level Sequences, and the camera (an OWL 360 dome camera: projection, dome_angle). Writes
+    scene.json to `out`, or next to `rig_path` (the rig's "scene" file if it names one), and returns a summary. Use the
+    names it lists in outputs (actors, params, MPC paths). paths = content folders searched for assets (default /Game)."""
+    scene = _live(_link(host).scan, paths or None)
+    path = None
+    if out:
+        path = os.path.abspath(out)
+    elif rig_path:
+        rp = _rig_path(rig_path)
+        path = os.path.join(os.path.dirname(rp), _read_json(rp).get("scene") or "scene.json")
+    if path:
+        _write_json(path, scene)
+    kinds, params = {}, {}
+    for name, a in scene.get("actors", {}).items():
+        for c in a.get("components", []):
+            if name not in kinds.setdefault(c["kind"], []):
+                kinds[c["kind"]].append(name)
+            for m in c.get("materials", []):
+                for p in m.get("scalars", []) + m.get("vectors", []):
+                    params[p] = params.get(p, 0) + 1
+    return _j({"scene_path": path, "level": scene.get("level"), "engine": scene.get("engine"),
+               "actors": len(scene.get("actors", {})),
+               "by_kind": {k: {"count": len(v), "names": v[:40]} for k, v in kinds.items()},
+               "material_params": params, "mpcs": scene.get("mpcs"), "sequences": scene.get("sequences", [])[:40],
+               "camera": scene.get("camera"), "scan_ms": scene.get("scan_ms"),
+               "next": "add \"scene\": \"scene.json\" to the rig so check can warn about unknown actors and params"})
+
+
+@tool
+def playhead_get(host: str | None = None) -> str:
+    """The sequence open in Sequencer, its playhead in display frames, whether it is playing, its fps and range."""
+    return _j(_live(_link(host).playhead_get))
+
+
+@tool
+def playhead_set(frame: float | None = None, playing: bool | None = None, sequence_path: str | None = None,
+                 host: str | None = None) -> str:
+    """Move the Sequencer playhead (display frames) and/or play (true) / pause (false). sequence_path opens that
+    sequence in Sequencer first if it is not the open one; that replaces whatever Sequencer was showing."""
+    return _j(_live(_link(host).playhead_set, frame, playing, sequence_path))
 
 
 # ------------------------------------------------------------------------------------------------ server
 TOOLS = [analyze, describe_audio, list_ops, get_rig, set_node, add_node, remove_node, set_output, remove_output,
          set_layer, check, get_notes, notes_init, notes_edit, notes_snap, bake, plot, preview_url, preview_start,
-         ue_apply, ue_undo, ue_check]
+         ue_scan, ue_apply, ue_undo, ue_check, live_push, playhead_get, playhead_set]
 
 INSTRUCTIONS = """beatrig turns music into deterministic animation keys. Files: rig.json (motion graph: nodes -> outputs),
 notes.json (editable hit lanes, times in audio seconds), bake.json (per-frame values + linear keys per target).
 Typical loop: analyze -> describe_audio -> notes_init (from a suggested band) -> list_ops -> add_node/set_node/
 set_output -> check -> bake -> plot (look at the result, adjust, repeat) -> ue_apply -> ue_check.
+With an editor open: ue_scan first (real actor, parameter and MPC names); live_push re-sends only changed outputs.
 Rules the engine enforces: nothing moves ahead of its sound; continuous motion is smoothed; only trigger envelopes may
 jump instantly; same inputs give the same bake. Paths are absolute or relative to the server's working directory."""
 

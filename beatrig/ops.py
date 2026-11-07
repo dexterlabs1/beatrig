@@ -1,10 +1,10 @@
-"""The v0 op set. Every op is causal: a frame's value depends only on audio up to the frame's start and on earlier frames.
+"""The op set. Every op is causal: a frame's value depends only on audio up to the frame's start and on earlier frames.
 Each op: fn(node, inputs: [Signal], ctx) -> Signal. SPECS holds the params (defaults; REQ = required), the input
-arity, and static channel/kind inference used by check()."""
+arity, static channel/kind inference used by check(), and whether the op accepts colour signals.
+The colour, per-hit flow, spatial and safety families live in their own modules and register here on import."""
 import numpy as np
-import scipy.signal as sg
 
-from .analysis import at_frames, follow, norm_db, time_to_frame, HOP_MS, STEP_MS
+from .analysis import at_frames, follow, norm_db, sg, time_to_frame, HOP_MS, STEP_MS
 from .signal import Signal, SHAPES, delay as delay_sig, empty_aux
 
 REQ = object()
@@ -20,11 +20,24 @@ class OpError(Exception):
 class Ctx:
     """per-bake constants: frame grid, tempo, analysis, notes"""
 
-    def __init__(self, fps, frames, offset, tempo, analysis=None, notes=None, seed=1, default_weights=None):
+    def __init__(self, fps, frames, offset, tempo, analysis=None, notes=None, seed=1, default_weights=None, t0=0.0,
+                 scene=None, safety=None, stems=None):
         self.fps, self.frames, self.offset = float(fps), int(frames), int(offset)
         self.tempo, self.analysis, self.notes, self.seed = tempo, analysis, notes or {}, int(seed)
         self.default_weights = default_weights
-        self.t = (np.arange(self.frames) - self.offset) / self.fps       # audio seconds at each frame's start
+        self.t0 = float(t0 or 0.0)                                      # rig audio_in_s: audio time of frame `offset`
+        self.t = (np.arange(self.frames) - self.offset) / self.fps + self.t0   # audio seconds at each frame's start
+        self.scene = scene or {}                                        # scene.json dict (positions, camera)
+        self.safety = safety or {"max_flashes_per_s": 3.0, "min_swing": 0.1}
+        self.stems = stems or {}                                        # stem name -> Analysis of that stem
+        self.rig_nodes = []
+
+    def frame_of(self, times):
+        """first frame at or after each audio time"""
+        return time_to_frame(times, self.fps, self.offset, self.t0)
+
+    def sample(self, env, step_ms):
+        return at_frames(env, step_ms, self.frames, self.fps, self.offset, self.t0)
 
     def ms_frames(self, ms):
         return float(ms) * self.fps / 1000.0
@@ -41,23 +54,33 @@ class Ctx:
         return None if b is None else self.beats_frames(b)
 
     def need_analysis(self, node):
+        """the analysis a source node reads: the mix, or with "stem": "drums" that stem's analysis"""
+        stem = node.get("stem")
+        if stem:
+            if stem not in self.stems:
+                raise OpError(node.get("id"), f"stem {stem!r} is not separated yet: run 'beatrig stems <rig>' (needs the [stems] extra)")
+            return self.stems[stem]
         if self.analysis is None:
             raise OpError(node.get("id"), "needs audio analysis (rig has no audio)")
         return self.analysis
 
 
 class Spec:
-    def __init__(self, fn, params, inputs, kind, chans, one_of=()):
+    def __init__(self, fn, params, inputs, kind, chans, one_of=(), color=False):
         self.fn, self.params, self.inputs, self.kind, self.chans, self.one_of = fn, params, inputs, kind, chans, one_of
+        self.color = color                  # True: accepts colour inputs (passes them through unless its kind says otherwise)
 
 
 SPECS = {}
+STEMS = ["drums", "bass", "vocals", "other"]
 
 
-def op(name, params=None, inputs="one", kind="value", chans=None, one_of=()):
-    """inputs: None | 'one' | 'many' | 'ref' (onsets: optional band node id or spec, not a signal input)"""
+def op(name, params=None, inputs="one", kind="value", chans=None, one_of=(), color=False):
+    """inputs: None | 'one' | 'many' | 'ref' (onsets: optional band node id or spec, not a signal input).
+    color: the op accepts colour signals (ops whose kind is "color" always do)."""
     def deco(fn):
-        SPECS[name] = Spec(fn, params or {}, inputs, kind, chans or (lambda n, c: c[0] if c else 1), one_of)
+        SPECS[name] = Spec(fn, params or {}, inputs, kind, chans or (lambda n, c: c[0] if c else 1), one_of,
+                           color or kind == "color")
         return fn
     return deco
 
@@ -93,37 +116,39 @@ def band_weights(node, ctx):
     return node.get("weights")
 
 
-@op("band", {"lo": REQ, "hi": REQ, "attack_ms": 10, "release_ms": 150, "weights": None}, inputs=None, chans=lambda n, c: 1)
+@op("band", {"lo": REQ, "hi": REQ, "attack_ms": 10, "release_ms": 150, "weights": None, "stem": None}, inputs=None,
+    chans=lambda n, c: 1)
 def op_band(node, ins, ctx):
     a = ctx.need_analysis(node)
     env = a.envelope("band", P(node, "lo"), P(node, "hi"), P(node, "attack_ms"), P(node, "release_ms"), node.get("weights"))
-    return Signal(at_frames(env, STEP_MS, ctx.frames, ctx.fps, ctx.offset))
+    return Signal(ctx.sample(env, STEP_MS))
 
 
-@op("loudness", {"attack_ms": 10, "release_ms": 150, "weights": None}, inputs=None, chans=lambda n, c: 1)
+@op("loudness", {"attack_ms": 10, "release_ms": 150, "weights": None, "stem": None}, inputs=None, chans=lambda n, c: 1)
 def op_loudness(node, ins, ctx):
     a = ctx.need_analysis(node)
     env = a.envelope("loud", None, None, P(node, "attack_ms"), P(node, "release_ms"), node.get("weights"))
-    return Signal(at_frames(env, STEP_MS, ctx.frames, ctx.fps, ctx.offset))
+    return Signal(ctx.sample(env, STEP_MS))
 
 
 def onset_band(node, rig_nodes):
-    """(lo, hi, weights) for an onsets node's `in`: a band node id, an inline {lo, hi} spec, or None (full range)"""
+    """(lo, hi, weights, stem) for an onsets node: `in` is a band node id, an inline {lo, hi} spec, or None (full
+    range). The stem is the node's own "stem", else the referenced band's."""
     ref = node.get("in")
     if ref is None:
-        return None, None, None
+        return None, None, None, node.get("stem")
     if isinstance(ref, dict):
-        return ref.get("lo"), ref.get("hi"), ref.get("weights")
+        return ref.get("lo"), ref.get("hi"), ref.get("weights"), node.get("stem") or ref.get("stem")
     src = next((n for n in rig_nodes if n.get("id") == ref), None)
     if src is None or src.get("op") != "band":
         raise OpError(node.get("id"), f"in={ref!r} must be a band node or a {{lo, hi}} spec")
-    return src.get("lo"), src.get("hi"), src.get("weights")
+    return src.get("lo"), src.get("hi"), src.get("weights"), node.get("stem") or src.get("stem")
 
 
 def detect_onsets(node, ctx, rig_nodes):
     """causal spectral-flux peaks -> (times s, velocities). time = (k + 1) * 5 ms, when the rise is known"""
-    a = ctx.need_analysis(node)
-    lo, hi, w = onset_band(node, rig_nodes)
+    lo, hi, w, stem = onset_band(node, rig_nodes)
+    a = ctx.need_analysis(dict(node, stem=stem))
     f = a.onset_fn(lo, hi, w).astype(np.float64)
     gap = max(1, int(round(float(P(node, "min_gap_ms")) / HOP_MS)))
     pk, _ = sg.find_peaks(f, distance=gap)
@@ -136,10 +161,10 @@ def detect_onsets(node, ctx, rig_nodes):
     return (pk[keep] + 1) * HOP_MS / 1000.0, np.clip(rel[keep], 0.05, 1.0)
 
 
-@op("onsets", {"threshold": 0.3, "min_gap_ms": 80}, inputs="ref", kind="trigger", chans=lambda n, c: 1)
+@op("onsets", {"threshold": 0.3, "min_gap_ms": 80, "stem": None}, inputs="ref", kind="trigger", chans=lambda n, c: 1)
 def op_onsets(node, ins, ctx):
     times, vels = detect_onsets(node, ctx, ctx.rig_nodes)
-    return hits_signal(time_to_frame(times, ctx.fps, ctx.offset), vels, ctx)
+    return hits_signal(ctx.frame_of(times), vels, ctx)
 
 
 def beat_times(node, ctx):
@@ -176,14 +201,16 @@ def beat_times(node, ctx):
 @op("beats", {"every": 1, "offset": 0, "subdivide": 1}, inputs=None, kind="trigger", chans=lambda n, c: 1)
 def op_beats(node, ins, ctx):
     times, vels = beat_times(node, ctx)
-    return hits_signal(time_to_frame(times, ctx.fps, ctx.offset), vels, ctx)
+    return hits_signal(ctx.frame_of(times), vels, ctx)
 
 
 @op("notes", {"track": REQ}, inputs=None, kind="trigger", chans=lambda n, c: 1)
 def op_notes(node, ins, ctx):
-    hits = ctx.notes.get("tracks", {}).get(node["track"], [])
+    """hits from notes.json; pattern placements are expanded (on the notes' bpm map) so every copy follows its pattern"""
+    from .notes import track_hits
+    hits = track_hits(ctx.notes, node["track"])
     times = [h["time"] for h in hits]
-    return hits_signal(time_to_frame(times, ctx.fps, ctx.offset), [h.get("vel", 1.0) for h in hits], ctx,
+    return hits_signal(ctx.frame_of(times), [h.get("vel", 1.0) for h in hits], ctx,
                        [h.get("len_beats") for h in hits], [h.get("shape") for h in hits])
 
 
@@ -237,10 +264,16 @@ def follow_rows(v, attack_ms, release_ms, dt_ms):
     return np.stack([follow(row, attack_ms, release_ms, dt_ms) for row in v])
 
 
-@op("smooth", {"attack_ms": REQ, "release_ms": REQ})
+@op("smooth", {"attack_ms": REQ, "release_ms": REQ}, kind=lambda n, k: "color" if k and k[0] == "color" else "value", color=True)
 def op_smooth(node, ins, ctx):
+    """one-pole follower per channel; a colour signal is smoothed per RGBA component (eased colour changes)"""
     s = ins[0]
-    return Signal(follow_rows(s.v, float(node["attack_ms"]), float(node["release_ms"]), 1000.0 / ctx.fps), "value", s.hits)
+    a, r, dt = float(node["attack_ms"]), float(node["release_ms"]), 1000.0 / ctx.fps
+    if s.kind == "color":
+        C, N, K = s.v.shape
+        rows = s.v.transpose(0, 2, 1).reshape(C * K, N)
+        return Signal(follow_rows(rows, a, r, dt).reshape(C, K, N).transpose(0, 2, 1), "color", s.hits)
+    return Signal(follow_rows(s.v, a, r, dt), "value", s.hits)
 
 
 @op("spring", {"freq_hz": 2.0, "damping": 0.6})
@@ -377,7 +410,8 @@ def per_channel_delay(node, ctx, C, base_ms="ms", base_beats="beats", step_ms="s
     return d
 
 
-@op("delay", {"ms": None, "beats": None, "step_ms": None, "step_beats": None}, one_of=(("ms", "beats"),))
+@op("delay", {"ms": None, "beats": None, "step_ms": None, "step_beats": None}, one_of=(("ms", "beats"),),
+    kind=lambda n, k: k[0] if k else "value", color=True)
 def op_delay(node, ins, ctx):
     s = ins[0]
     return delay_sig(s, per_channel_delay(node, ctx, s.channels))
@@ -439,7 +473,7 @@ def same_kind(n, k):
     return k[0] if k else "value"
 
 
-@op("fanout", {"channels": REQ}, kind=same_kind, chans=lambda n, c: int(n["channels"]))
+@op("fanout", {"channels": REQ}, kind=same_kind, chans=lambda n, c: int(n["channels"]), color=True)
 def op_fanout(node, ins, ctx):
     s = ins[0]
     if s.channels != 1:
@@ -457,7 +491,7 @@ def chase_index(C, direction, wrap):
 
 
 @op("chase", {"channels": REQ, "step_ms": None, "step_beats": None, "direction": 1, "wrap": True}, kind=same_kind,
-    chans=lambda n, c: int(n["channels"]), one_of=(("step_ms", "step_beats"),))
+    chans=lambda n, c: int(n["channels"]), one_of=(("step_ms", "step_beats"),), color=True)
 def op_chase(node, ins, ctx):
     """channel i = in delayed by i * step"""
     s = ins[0]
@@ -508,12 +542,34 @@ def op_cycle(node, ins, ctx):
     return Signal(v, "trigger", v != 0, aux)
 
 
-@op("ripple", {"neighbours": 2, "falloff": 0.5, "step_ms": 40, "ring": True}, kind=same_kind)
+@op("ripple", {"neighbours": 2, "falloff": 0.5, "step_ms": 40, "ring": True, "k": 3, "hops": 2, "actors": None}, kind=same_kind)
 def op_ripple(node, ins, ctx):
-    """each channel's signal spreads to neighbours at distance d, delayed d*step and scaled falloff^d; max-combined"""
+    """each channel's signal spreads to neighbours at distance d, delayed d*step and scaled falloff^d; max-combined.
+    neighbours = N: channel index distance on a ring/line. neighbours = "knn": graph distance (hops) in the graph
+    joining each actor to its k nearest actors by real position (scene.json); channel i = actors[i]."""
     s = ins[0]
     C = s.channels
-    nb, fo, step, ring = int(P(node, "neighbours")), float(P(node, "falloff")), ctx.ms_frames(P(node, "step_ms")), bool(P(node, "ring"))
+    fo, step = float(P(node, "falloff")), ctx.ms_frames(P(node, "step_ms"))
+    if P(node, "neighbours") == "knn":
+        from .spatial import actor_positions, knn_hops
+        pos = actor_positions(ctx, node)
+        if len(pos) != C:
+            raise OpError(node.get("id"), f"ripple knn: input has {C} channels but {len(pos)} actors")
+        hop = knn_hops(pos, int(P(node, "k")), int(P(node, "hops")))
+        out = s.v.astype(np.float64).copy()
+        hits = s.hits.copy()
+        for d in range(1, int(P(node, "hops")) + 1):
+            mask = hop == d
+            if not mask.any():
+                continue
+            dl = delay_sig(s, d * step)
+            for j in range(C):
+                src = np.flatnonzero(mask[j])
+                if len(src):
+                    np.maximum(out[j], dl.v[src].max(axis=0) * fo ** d, out=out[j])
+                    hits[j] |= dl.hits[src].any(axis=0)
+        return Signal(out, s.kind, hits, empty_aux(out.shape) if s.kind == "trigger" else None)
+    nb, ring = int(P(node, "neighbours")), bool(P(node, "ring"))
     out = s.v.astype(np.float64).copy()
     hits = s.hits.copy()
     for d in range(1, nb + 1):
@@ -532,19 +588,19 @@ def op_ripple(node, ins, ctx):
     return Signal(out, s.kind, hits, empty_aux(out.shape) if s.kind == "trigger" else None)
 
 
-@op("mirror", {}, kind=same_kind)
+@op("mirror", {}, kind=same_kind, color=True)
 def op_mirror(node, ins, ctx):
     """symmetric pattern: out[i] = in[min(i, C-1-i)]"""
     C = ins[0].channels
     return ins[0].take([min(i, C - 1 - i) for i in range(C)])
 
 
-@op("reverse", {}, kind=same_kind)
+@op("reverse", {}, kind=same_kind, color=True)
 def op_reverse(node, ins, ctx):
     return ins[0].take(list(range(ins[0].channels))[::-1])
 
 
-@op("select", {"channels": REQ}, kind=same_kind, chans=lambda n, c: len(n.get("channels") or []))
+@op("select", {"channels": REQ}, kind=same_kind, chans=lambda n, c: len(n.get("channels") or []), color=True)
 def op_select(node, ins, ctx):
     idx = [int(i) for i in node["channels"]]
     if any(not 0 <= i < ins[0].channels for i in idx):
@@ -561,11 +617,29 @@ def op_merge(node, ins, ctx):
     return Signal(y, kind, s.hits.any(axis=0)[None, :], empty_aux((1, ctx.frames)) if kind == "trigger" else None)
 
 
-@op("shuffle", {"seed": None}, kind=same_kind)
+@op("shuffle", {"seed": None}, kind=same_kind, color=True)
 def op_shuffle(node, ins, ctx):
     """fixed channel permutation (node seed, else rig seed)"""
     rng = np.random.default_rng(int(node["seed"]) if node.get("seed") is not None else ctx.seed)
     return ins[0].take(rng.permutation(ins[0].channels).tolist())
+
+
+@op("accumulate", {"per_s": None, "per_beat": None, "start": 0.0, "wrap": None}, one_of=(("per_s", "per_beat"),))
+def op_accumulate(node, ins, ctx):
+    """running sum (an integral): out[f] = start + the sum over frames before f of in x rate x frame time. A constant
+    1 with per_s 0.5 turns half a unit per second; per_beat follows the tempo map. Causal by construction; the output
+    is continuous even when the input jumps, so a trigger envelope becomes an eased step (spin bursts, phase pushes).
+    wrap: fold into [0, wrap) (an instant jump at each wrap; leave it off for transform outputs)."""
+    s = ins[0]
+    if node.get("per_beat") is not None:
+        inc = float(node["per_beat"]) * ctx.tempo.bpm_at(ctx.t) / 60.0 / ctx.fps
+    else:
+        inc = np.full(ctx.frames, float(node["per_s"] if node.get("per_s") is not None else 1.0) / ctx.fps)
+    x = s.v.astype(np.float64) * inc[None, :]
+    y = float(P(node, "start")) + np.concatenate((np.zeros((s.channels, 1)), np.cumsum(x, axis=1)[:, :-1]), axis=1)
+    if node.get("wrap"):
+        y = np.mod(y, float(node["wrap"]))
+    return Signal(y, "value", s.hits)
 
 
 def input_ids(node):
@@ -579,3 +653,7 @@ def input_ids(node):
     if isinstance(ref, list):
         return list(ref)
     return [ref]
+
+
+# the colour, per-hit flow, spatial and safety families register their ops on import
+from . import color, flow, spatial, safety  # noqa: E402,F401

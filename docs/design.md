@@ -49,7 +49,7 @@ an AI agent can drive every step over MCP. A local preview page lets a human see
       "target": { "kind": "light", "actors": ["Light_0", "...", "Light_7"], "property": "intensity" },
       "min": 500, "max": 20000 },        // channel i -> actor i; 1 channel + N actors = "same" mode
     { "id": "glow", "signal": "kickS",
-      "target": { "kind": "mpc", "asset": "/Game/VBTest/MPC_VB", "param": "Glow" }, "min": 0.2, "max": 3 }
+      "target": { "kind": "mpc", "asset": "/Game/Show/MPC_Show", "param": "Glow" }, "min": 0.2, "max": 3 }
   ],
   "bake": { "key_tolerance": 0.002 }    // relative RDP tolerance for key simplification
 }
@@ -135,28 +135,27 @@ Every editing action the UI offers maps to this file.
 tolerance is relative to max-min. The first and last frames are always kept, and every trigger hit frame is kept.
 
 ## Preview server (`serve`, http://127.0.0.1:4700)
-- `GET /` page. `GET /api/state` returns the rig, notes, analysis summary (waveform peaks at about 200 px/s, band previews, beats, bpm map),
-  and the bake (values downsampled to ≤ 2000 points/channel plus full key lists).
-- `GET /api/audio` streams the wav. `POST /api/rig` (full rig JSON) validates, re-bakes and returns the new bake (or errors).
-  `POST /api/notes` saves notes, re-bakes and returns the result. `POST /api/save` writes rig.json/notes.json to disk (a backup `.bak` first).
-- The page shows:
-  - the waveform plus a beat grid
-  - note lanes per track (click to add, drag to move, drag vertically for velocity, Delete removes, snap toggle)
-  - a curve view per output channel
-  - a schematic preview: lights as a ring of dots whose brightness follows their channel, MPC params as bars
-  - an audio player with a playhead synced to all views
-  - a param panel generated from the rig: a slider for every numeric node/output param, with re-bake on release
-- No framework build step: plain HTML/JS/CSS served by the Python server (stdlib `http.server`), so it runs anywhere.
+v0 shipped a JSON-only, polling page; v0.2 replaced the transport (see "Server endpoints added" in the v0.2 sections):
+- `GET /api/state` returns metadata only: rig, notes, analysis summary, per-output content hash and key counts, scene,
+  live status, flash flags.
+- `GET /api/curves?output=<id>&lod=<n>` and `GET /api/peaks?lod=<n>` return binary little-endian float32 (uint8 for
+  peaks) behind a small JSON header. lod 0 is per frame; lod n is min/max per 4^n frames.
+- `GET /api/events` is a server-sent event stream (rev changes, agent activity, live-push status, editor playhead).
+  There is no polling.
+- `POST /api/rig`, `/api/notes`, `/api/edit` re-bake in memory; `POST /api/save` writes to disk with a `.bak`.
+  `/api/live`, `/api/playhead`, `/api/scan` drive `beatrig.live.Link`.
+- Plain HTML/JS/CSS, Canvas 2D, no build step. Measured on a 60-minute rig: first paint 0.4-0.7 s, a full redraw
+  6.2 ms or less, `/api/state` 0.24 MB (it was 14 MB as JSON).
 
-## Unreal applier (`ue/beatrig_apply.py`, runs inside the editor; NOT run in v0)
-Reads bake.json and writes keys into a Level Sequence. Everything goes on tracks tagged `beatrig:<output id>`, so `undo` removes
-exactly what it wrote. It covers MPC scalar/vector params (MovieScene MPC track; **keys take TICK time, 24000/s, not frames**:
-), light intensity/colour, material scalar/vector params on actors, Niagara user params, and transforms
-(additive). Steps: `apply <seq> <bake>`, `undo <seq> [output]`, `check <seq> <bake>` (reads keys back and compares).
+## Unreal applier (`ue/beatrig_apply.py`, runs inside the editor)
+Reads bake.json and writes keys into a Level Sequence, on tracks named `beatrig:<output id>[:<actor>]` and bindings
+tagged `beatrig`, so `undo` removes exactly what it wrote. It covers MPC scalar/vector params (**keys take TICK time,
+24000/s, not frames**), light intensity/colour, material scalar/vector params on actors, Niagara user params, and
+additive transforms. Tested live in UE 5.8.3 (docs/unreal.md). Loaded once as a module by the live link; also
+runnable from the editor console: `apply <seq> <bake>`, `undo <seq> [output]`, `check <seq> <bake>`.
 
-## Later (not v0)
-Stems (Demucs, CPU, opt-in), layouts (spawn/arrange actor rings and grids in UE), live MIDI/OSC, DMX out, sending a
-preview to a running editor over Remote Control.
+## Later
+Layouts (spawn and arrange actor rings and grids in UE), live MIDI/OSC input, DMX out, appliers for other hosts.
 
 ## v0.2 contract additions (all three workstreams code against this)
 
@@ -200,9 +199,21 @@ A rig points at it with `"scene": "scene.json"` (optional). `check` then warns a
 - `playhead_get()` and `playhead_set(frame, playing)` work on the sequence open in Sequencer.
 
 ### Server endpoints added (page ↔ live)
-`POST /api/live {enabled, sequence}`, `GET /api/live` (status, last push ms), `POST /api/playhead {frame, playing}`,
-`GET /api/playhead` (editor time, for following the editor), `POST /api/scan` (refresh scene.json from the editor).
-When live is on, every successful re-bake pushes changed outputs.
+`POST /api/live {enabled, sequence, link_playhead}`, `GET /api/live` (status, last push: pushed/skipped ids, ms),
+`POST /api/playhead {frame, playing}` (refused when a live sequence is set and Sequencer shows another one),
+`GET /api/playhead` (the editor's), `POST /api/scan` (writes scene.json; a rig without `scene` gets it set, unsaved).
+When live is on, every successful re-bake pushes changed outputs (a worker thread, newest bake wins).
+- **Long shows: `/api/state` is metadata only** (rig, notes as written, analysis summary without peaks, outputs with
+  per-channel `key_count` and a content `hash`, scene, live status, flash-safety windows). Curve data is binary:
+  `GET /api/curves?output=<id>|band=<id>&lod=<n>` and `GET /api/peaks?lod=<n>` return a uint32 LE header length, a
+  JSON header (padded to 4 bytes), then the data: lod 0 = float32 per frame `[channels][frames]` (colour
+  `[channels][frames][4]`); lod n = min/max (colour: mean RGBA) per 4^n frames; peaks = uint8 max |mono| per 5 ms·4^n.
+  The page refetches an output only when its `hash` changed and builds its own min/max pyramid for zooming.
+- **`GET /api/events`** (Server-Sent Events, replaces polling): `rev` {rev, server, dirty, activity} on every state
+  change (a new `server` id means it restarted), `live` on push status changes, `playhead` {sequence, frame,
+  playing} from the editor at ≤ 20 Hz, only while a page has `link_playhead` on. Heartbeat comment every 15 s.
+- `POST /api/edit {rig, notes}` re-bakes both in one step (an edit valid only as a pair, e.g. renaming a section that a
+  layer key names). `GET /api/ops` lists the op specs (params + defaults, required, inputs, enums) for the graph editor.
 
 ### notes.json additions (v0.2)
 ```jsonc

@@ -14,16 +14,35 @@
   <div class="readout wide" title="Audio time"><span id="t-sec">0.000</span><small>s</small></div>
   <div class="readout" title="Sequence frame"><span id="t-frame">0</span><small>f</small></div>
   <div class="readout" title="Bar . beat . sixteenth"><span id="t-beat">1.1.1</span></div>
-  <div class="readout" title="Tempo (notes.json bpm map)"><span id="bpm">-</span><small>bpm</small></div>
-  <div class="readout" title="Frame rate"><span id="fps">-</span><small>fps</small></div>
+  <div class="readout" title="Tempo at the playhead (notes.json bpm map)"><span id="bpm">-</span><small>bpm</small></div>
   <span class="sep"></span>
+  <button id="click" class="tog" title="Metronome: click on every beat, accent on the downbeat (C)">Click</button>
+  <input id="click-vol" type="range" min="0" max="1" step="0.01" value="0.5" title="Metronome volume">
+  <span class="sep"></span>
+  <span class="lbl" title="Tap-record: while playing, keys 1-9 add hits to the lanes they are assigned to. Shift+digit over a lane assigns that key to it">Rec</span>
+  <input id="rec-lat" class="num" type="number" value="30" step="1" min="0" max="500" title="Latency compensation in ms, subtracted from each tap"><small class="unit dim">ms</small>
+  <button id="rec-replace" class="tog" title="Replace: when a take ends, hits it played over are removed from the lanes you tapped into">Replace</button>
+  <span class="spacer"></span>
+  <button id="live" class="tog" title="Live: after every successful re-bake, push the changed outputs into this Level Sequence">Live</button>
+  <input id="live-seq" type="text" list="seq-list" spellcheck="false" placeholder="/Game/Path/LS_Name" title="Level Sequence to push into">
+  <datalist id="seq-list"></datalist>
+  <button id="link" class="tog" title="Link playhead: playing here drives the editor's playhead; paused, this page follows the editor">Link</button>
+  <span id="live-info" class="dim"></span>
+  <span class="sep"></span>
+  <button id="flash" class="flashes" hidden title="Flash-safety windows: click to jump to the next one"></button>
+  <span id="bake-info" class="dim">-</span>
+  <span id="dirty" class="dirty" hidden>Unsaved</span>
+  <button id="save" title="Write rig.json and notes.json (Ctrl+S)" disabled>Save</button>
+</header>
+
+<div id="toolbar">
   <span class="lbl">Zoom</span>
-  <button id="zoom-out" class="icon" title="Zoom out (Ctrl+wheel)">&minus;</button>
+  <button id="zoom-out" class="icon" title="Zoom out (-, Ctrl+wheel)">&minus;</button>
   <input id="zoom" type="range" min="0" max="1000" value="0" title="Zoom">
-  <button id="zoom-in" class="icon" title="Zoom in (Ctrl+wheel)">+</button>
-  <button id="zoom-fit" title="Fit the whole clip">Fit</button>
+  <button id="zoom-in" class="icon" title="Zoom in (=, Ctrl+wheel)">+</button>
+  <button id="zoom-fit" title="Fit the whole clip (\)">Fit</button>
   <span class="sep"></span>
-  <label class="chk" title="Snap note edits to the grid"><input id="snap" type="checkbox" checked> Snap</label>
+  <label class="chk" title="Snap note, pattern and section edits to the grid"><input id="snap" type="checkbox" checked> Snap</label>
   <select id="grid" title="Grid size in beats">
     <option value="1">1 beat</option>
     <option value="0.5">1/2 beat</option>
@@ -31,35 +50,53 @@
     <option value="0.125">1/8 beat</option>
     <option value="0.0625">1/16 beat</option>
   </select>
-  <label class="chk" title="Page the view with the playhead"><input id="follow" type="checkbox" checked> Follow</label>
+  <label class="chk" title="Page the view with the playhead (F)"><input id="follow" type="checkbox" checked> Follow</label>
+  <span class="sep"></span>
+  <button id="mk-pat" title="Turn the selected hits into a linked pattern (P)">Make pattern</button>
+  <button id="dup-pat" title="Place a linked copy after the selected pattern (Ctrl+D)">Copy</button>
+  <button id="unlink-pat" title="Turn the selected pattern copy back into plain hits (U)">Unlink</button>
+  <span class="sep"></span>
+  <button id="add-sec" title="Add a section marker at the playhead (M)">Add section</button>
   <span class="spacer"></span>
-  <span id="bake-info" class="dim">-</span>
-  <span id="dirty" class="dirty" hidden>Unsaved</span>
-  <button id="save" title="Write rig.json and notes.json (Ctrl+S)" disabled>Save</button>
-</header>
+  <span id="sel-info" class="dim"></span>
+  <button id="undo" class="icon" title="Undo (Ctrl+Z)" disabled><svg viewBox="0 0 16 16" width="12" height="12"><path d="M5 4V1L0 5.5 5 10V7c4 0 6.5 1 8 4.5C12.5 7 10 4.4 5 4z"/></svg></button>
+  <button id="redo" class="icon" title="Redo (Ctrl+Shift+Z)" disabled><svg viewBox="0 0 16 16" width="12" height="12"><path d="M11 4V1l5 4.5-5 4.5V7c-4 0-6.5 1-8 4.5C3.5 7 6 4.4 11 4z"/></svg></button>
+  <button id="help" class="icon" title="Keyboard shortcuts (?)">?</button>
+</div>
 
 <main id="timeline">
   <div id="lanes">
     <div id="lanes-top">
       <div class="lane ruler"><div class="lane-head"><span class="dim">Time</span></div><canvas data-kind="ruler"></canvas></div>
+      <div class="lane sections"><div class="lane-head"><span>Sections</span><small id="sec-count" class="dim"></small></div><canvas data-kind="sections"></canvas></div>
       <div class="lane wave"><div class="lane-head"><span>Audio</span><small id="audio-name" class="dim"></small></div><canvas data-kind="wave"></canvas></div>
       <div id="band-lanes"></div>
     </div>
-    <div class="group-head">Notes <small class="dim">click to add, drag to move, drag up/down for velocity, Delete removes</small></div>
+    <div class="group-head">Notes <small class="dim">click adds, drag moves, drag up/down sets velocity; keys 1-9 tap-record while playing</small></div>
     <div id="note-lanes"></div>
+    <div id="layer-group" class="group-head" hidden>Layers <small class="dim">intensity; keys that name a section move with it</small></div>
+    <div id="layer-lanes"></div>
     <div class="group-head">Outputs</div>
     <div id="curve-lanes"></div>
     <div id="playhead"></div>
   </div>
+  <input id="rename" type="text" spellcheck="false" hidden>
 </main>
 
 <aside id="side">
   <section id="schem">
-    <h2>Preview <small id="schem-frame" class="dim"></small></h2>
+    <h2><span>Preview <small id="schem-frame" class="dim"></small></span>
+      <span class="tabs" role="tablist">
+        <button data-view="ring" class="on" title="Outputs as rings and bars (V cycles)">Ring</button><button data-view="plan" title="Top-down plan of the scanned actors">Plan</button><button data-view="dome" title="Domemaster seen from the scene camera">Dome</button>
+      </span>
+    </h2>
     <canvas id="schem-canvas"></canvas>
+    <div id="scene-bar"><small id="scene-info" class="dim">no scene.json</small><button id="scan" title="Read actors, positions, components and the camera from the editor (needs the live link)">Scan</button></div>
   </section>
   <section id="params">
-    <h2>Parameters <small class="dim">release a slider to re-bake</small></h2>
+    <h2><span title="Every numeric parameter as a slider; releasing one re-bakes">Graph</span>
+      <span><button id="add-node" title="Add a node">Add node</button><button id="add-out" title="Add an output">Add output</button></span></h2>
+    <form id="graph-form" hidden autocomplete="off"></form>
     <div id="param-error" class="err" hidden></div>
     <div id="param-list"></div>
   </section>
@@ -76,7 +113,31 @@
   <span id="msg"></span>
 </footer>
 
-<audio id="audio" src="/api/audio" preload="auto"></audio>
+<div id="help-panel" hidden>
+  <h3>Keys</h3>
+  <dl>
+    <dt>Space</dt><dd>play / pause</dd>
+    <dt>1 - 9</dt><dd>tap-record into the lane on that key (while playing)</dd>
+    <dt>Shift+1 - 9</dt><dd>assign that key to the lane under the pointer</dd>
+    <dt>C</dt><dd>metronome</dd>
+    <dt>M</dt><dd>add a section at the playhead</dd>
+    <dt>P</dt><dd>make a pattern from the selected hits</dd>
+    <dt>Ctrl+D</dt><dd>linked copy of the selected pattern</dd>
+    <dt>U</dt><dd>unlink the selected pattern copy</dd>
+    <dt>Alt+drag</dt><dd>on a pattern strip: drag out a linked copy</dd>
+    <dt>Delete</dt><dd>remove the selection</dd>
+    <dt>Left / Right</dt><dd>nudge the selection one grid step; no selection: one frame (Shift: one beat)</dd>
+    <dt>Up / Down</dt><dd>selected hits' velocity</dd>
+    <dt>Ctrl+Z, Ctrl+Shift+Z</dt><dd>undo, redo</dd>
+    <dt>= / - / \</dt><dd>zoom in, out, fit</dd>
+    <dt>F</dt><dd>follow the playhead</dd>
+    <dt>V</dt><dd>preview: ring, plan, dome</dd>
+    <dt>Home</dt><dd>back to the start</dd>
+    <dt>Ctrl+S</dt><dd>save</dd>
+  </dl>
+</div>
+
+<audio id="audio" src="/api/audio" preload="metadata"></audio>
 <script src="app.js"></script>
 </body>
 </html>

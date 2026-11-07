@@ -209,3 +209,59 @@ def test_rdp_simplifies_smooth_decay():
     vals = np.round(0.2 + s.v[0].astype(np.float64) * 2.8, 4)
     k2 = rdp(vals, tol, np.flatnonzero(s.hits[0]))
     assert len(k2) < 300 / 4, len(k2)
+
+
+def _rdp_reference(v, tol, forced=()):
+    """the plain one-span-at-a-time RDP the batched one must match frame for frame"""
+    v = np.asarray(v, np.float64)
+    keep = np.zeros(len(v), bool)
+    keep[0] = keep[-1] = True
+    keep[list(forced)] = True
+    idx = np.flatnonzero(keep)
+    stack = list(zip(idx[:-1].tolist(), idx[1:].tolist()))
+    while stack:
+        a, b = stack.pop()
+        if b - a < 2:
+            continue
+        t = np.arange(1, b - a, dtype=np.float64) / (b - a)
+        lin = v[a] + (v[b] - v[a]) * (t[:, None] if v.ndim == 2 else t)
+        err = np.abs(v[a + 1:b] - lin)
+        err = err.max(axis=1) if v.ndim == 2 else err
+        k = int(np.argmax(err))
+        if err[k] > tol:
+            keep[a + 1 + k] = True
+            stack += [(a, a + 1 + k), (a + 1 + k, b)]
+    return np.flatnonzero(keep)
+
+
+def test_batched_rdp_matches_the_reference():
+    rng = np.random.default_rng(3)
+    for n, dims in ((3000, None), (3000, 4), (257, None), (5, 4)):
+        shape = (n,) if dims is None else (n, dims)
+        v = np.round(np.cumsum(rng.standard_normal(shape) * 0.02, axis=0), 4)
+        v[n // 3:n // 3 + 4] = 0.5                                       # plateaus and ties
+        forced = sorted(set(rng.integers(0, n, 12).tolist()))
+        for tol in (0.0, 0.003, 0.05, 2.0):
+            assert np.array_equal(rdp(v, tol, forced), _rdp_reference(v, tol, forced)), (n, dims, tol)
+
+
+def test_cached_analyze_is_a_pure_read():
+    """editing attack/release (a new envelope) never rewrites the cache; only a new audio pass (a new band) does, and
+    envelopes are never stored in it"""
+    d = rig_folder({"fps": FPS, "nodes": [{"id": "k", "op": "band", "lo": 40, "hi": 120}], "outputs": []})
+    A._MEMO.clear()
+    npz = os.path.join(d, "analysis.npz")
+    def run(nodes):
+        rig = beatrig.Rig.from_dict({"audio": "clicks.wav", "fps": FPS, "nodes": nodes, "outputs": []}, d)
+        an = beatrig.analyze(rig)
+        beatrig.evaluate(rig, an, {})
+        return os.stat(npz).st_mtime_ns
+    m0 = run([{"id": "k", "op": "band", "lo": 40, "hi": 120}])
+    for att in (3, 7, 3):
+        assert run([{"id": "k", "op": "band", "lo": 40, "hi": 120, "attack_ms": att}]) == m0
+    A._MEMO.clear()                                                   # a fresh process reads the same file
+    assert run([{"id": "k", "op": "band", "lo": 40, "hi": 120, "attack_ms": 9}]) == m0
+    m1 = run([{"id": "k", "op": "band", "lo": 200, "hi": 400}])       # a new band needs an audio pass: written once
+    assert m1 != m0 and run([{"id": "k", "op": "band", "lo": 200, "hi": 400, "release_ms": 50}]) == m1
+    with np.load(npz) as z:
+        assert not [k for k in z.files if k.startswith("env:")]

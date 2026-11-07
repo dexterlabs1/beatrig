@@ -13,6 +13,10 @@ Grids: band/loudness envelopes on an exact 1 ms grid, the onset function on a 5 
 [floor(j*sr*step/1000), floor((j+1)*sr*step/1000)) and its value is known only at the block's END, so grid index k
 is the value at (k + 1) * step ms. Audio is read in 10 s chunks (a whole number of 1 ms and 5 ms blocks at any sample
 rate) with the filter state carried across chunks, so a 60-min show never sits in memory as float64.
+
+The beats are checked against an independent reference onset list: log-mel spectral flux on a ~12 kHz mono copy
+(21 ms Hann window, 5 ms hop, 40 mel bands, peak-picked), streamed through the same chunk loop. It is a different
+method from the octave-band flux that places the beats, so the agreement test is not circular.
 """
 import hashlib
 import json
@@ -20,15 +24,35 @@ import os
 from typing import Optional
 
 import numpy as np
-import scipy.signal as sg
 import soundfile as sf
 
-ANALYSIS_VERSION = 3
+
+class _Lazy:
+    """a module imported on first attribute use: scipy.signal is most of beatrig's import time, and check, the MCP
+    server and the preview server often never need it"""
+
+    def __init__(self, name):
+        self._name, self._mod = name, None
+
+    def __getattr__(self, attr):
+        if self._mod is None:
+            import importlib
+            self._mod = importlib.import_module(self._name)
+        return getattr(self._mod, attr)
+
+
+sg = _Lazy("scipy.signal")
+
+ANALYSIS_VERSION = 4
 ONSET_EDGES = [30, 60, 120, 240, 480, 960, 1920, 3840, 7680, 15360]   # octave bands for the onset function
 STEP_MS = 1                 # envelope grid
 HOP_MS = 5                  # onset grid
 CHUNK_S = 10                # read size
+REF_NFFT, REF_MELS = 256, 40
+ENV_KEEP = 24               # derived envelopes kept in memory per analysis (never written to the cache)
 DEFAULT_SETTINGS = dict(bpm_min=75.0, bpm_max=150.0, pulse_z=4.0, min_conf=0.15, min_agree=0.15, win_s=16.0, hop_s=4.0)
+# tempo candidates: the metrical levels a tempo estimate is most often confused with
+CANDIDATE_RATIOS = [("x1", 1.0), ("x2", 2.0), ("x1/2", 0.5), ("x3/2", 1.5), ("x2/3", 2 / 3), ("x4/3", 4 / 3), ("x3/4", 0.75)]
 
 _MEMO = {}                  # (audio, size, mtime, settings hash) -> Analysis, so the preview server re-bakes fast
 
@@ -66,9 +90,14 @@ def grid_power(y, sr, step_ms):
     A block's value is known only at its END (causal)."""
     n = y.shape[0]
     nb = (n * 1000) // (sr * step_ms)
+    if (sr * step_ms) % 1000 == 0:                         # whole samples per block (48 kHz): a reshape, no cumsum
+        m = sr * step_ms // 1000
+        sq = np.square(y[:nb * m])
+        return sq.reshape((nb, m) + y.shape[1:]).mean(axis=1)
     e = (np.arange(nb + 1) * sr * step_ms) // 1000
-    cs = np.concatenate((np.zeros((1,) + y.shape[1:]), np.cumsum(np.square(y), axis=0)))
-    return (cs[e[1:]] - cs[e[:-1]]) / np.diff(e).reshape((-1,) + (1,) * (y.ndim - 1))
+    if nb == 0:
+        return np.zeros((0,) + y.shape[1:])
+    return np.add.reduceat(np.square(y[:e[-1]]), e[:-1], axis=0) / np.diff(e).reshape((-1,) + (1,) * (y.ndim - 1))
 
 
 def follow(x, attack_ms, release_ms, dt_ms=1.0):
@@ -82,20 +111,22 @@ def follow(x, attack_ms, release_ms, dt_ms=1.0):
     return y
 
 
-def at_frames(env, step_ms, frames, fps, offset=0):
-    """value for sequence frame f = env at the frame's start time (audio time (f - offset) / fps); never reads the
-    future. Grid index k is known at (k + 1) * step ms, so frame f reads k = floor(t_ms / step) - 1. Frames before the
-    audio read silence (0); frames past the end hold the last value."""
+def at_frames(env, step_ms, frames, fps, offset=0, t0=0.0):
+    """value for sequence frame f = env at the frame's start time (audio time t0 + (f - offset) / fps); never reads
+    the future. Grid index k is known at (k + 1) * step ms, so frame f reads k = floor(t_ms / step) - 1. Frames before
+    the audio read silence (0); frames past the end hold the last value. t0 = rig audio_in_s (a window into a long file)."""
     t_ms = (np.arange(frames) - offset) * 1000.0 / fps
+    if t0:
+        t_ms = np.round(t_ms + float(t0) * 1000.0, 6)
     k = np.floor(t_ms / step_ms).astype(np.int64) - 1
     if len(env) == 0:
         return np.zeros(frames, np.float32)
     return np.where(k >= 0, env[np.clip(k, 0, len(env) - 1)], 0.0).astype(np.float32)
 
 
-def time_to_frame(t, fps, offset=0):
-    """first sequence frame whose start is at or after audio time t"""
-    return (np.ceil(np.round(np.asarray(t, np.float64) * fps, 6)).astype(np.int64) + int(offset))
+def time_to_frame(t, fps, offset=0, t0=0.0):
+    """first sequence frame whose start is at or after audio time t (t0 = audio time of frame `offset`)"""
+    return (np.ceil(np.round((np.asarray(t, np.float64) - float(t0)) * fps, 6)).astype(np.int64) + int(offset))
 
 
 def norm_db(v, range_db, hi_pct=99.5, lo_pct=10):
@@ -121,6 +152,107 @@ def flux(p):
     return d * np.clip((e - floor) / 12, 0, 1)                         # a rise out of the noise floor counts for little
 
 
+# ---------- reference onsets (independent check of the beats; never used to place them)
+def _hz_to_mel(f):
+    """Slaney mel scale: linear below 1 kHz, logarithmic above"""
+    f = np.asarray(f, np.float64)
+    sp, lin_mel, step = 200.0 / 3, 1000.0 / (200.0 / 3), np.log(6.4) / 27.0
+    return np.where(f >= 1000.0, lin_mel + np.log(np.maximum(f, 1e-12) / 1000.0) / step, f / sp)
+
+
+def _mel_to_hz(m):
+    m = np.asarray(m, np.float64)
+    sp, lin_mel, step = 200.0 / 3, 1000.0 / (200.0 / 3), np.log(6.4) / 27.0
+    return np.where(m >= lin_mel, 1000.0 * np.exp(step * (m - lin_mel)), sp * m)
+
+
+def mel_filters(sr, n_fft, n_mels):
+    """[n_mels, n_fft/2 + 1] area-normalised triangular mel filters from 0 Hz to Nyquist"""
+    fft_f = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    mel_f = _mel_to_hz(np.linspace(_hz_to_mel(0.0), _hz_to_mel(sr / 2.0), n_mels + 2))
+    fdiff = np.diff(mel_f)
+    ramps = mel_f[:, None] - fft_f[None, :]
+    w = np.maximum(0, np.minimum(-ramps[:-2] / fdiff[:-1, None], ramps[2:] / fdiff[1:, None]))
+    return (w * (2.0 / (mel_f[2:] - mel_f[:-2]))[:, None]).astype(np.float32)
+
+
+def peak_pick(x, pre_max, post_max, pre_avg, post_avg, delta, wait):
+    """indices n where x[n] is the max of x[n-pre_max : n+post_max], at least mean(x[n-pre_avg : n+post_avg]) + delta,
+    and more than `wait` samples after the previous pick (windows truncated at the ends)"""
+    n = len(x)
+    if n == 0:
+        return np.zeros(0, np.int64)
+    pad = np.concatenate((np.full(pre_max, -np.inf, x.dtype), x, np.full(post_max, -np.inf, x.dtype)))
+    mov_max = np.lib.stride_tricks.sliding_window_view(pad, pre_max + post_max)[:n].max(axis=1)
+    cs = np.concatenate(([0.0], np.cumsum(x, dtype=np.float64)))
+    i = np.arange(n)
+    a, b = np.maximum(0, i - pre_avg), np.minimum(n, i + post_avg)
+    mov_avg = ((cs[b] - cs[a]) / (b - a)).astype(x.dtype)
+    cand = np.flatnonzero((x == mov_max) & (x >= mov_avg + x.dtype.type(delta)))
+    out, last = [], -np.inf
+    for k in cand.tolist():
+        if k > last + wait:
+            out.append(k)
+            last = k
+    return np.asarray(out, np.int64)
+
+
+class RefFlux:
+    """streaming log-mel spectral flux: feed() mono chunks at rate `sr`, finish() -> onset times (s).
+    Frame k is centred on sample k * hop (zero-padded by n_fft / 2 at both ends). Mel energies are kept as float32
+    (40 x frames, ~115 MB at 60 min); the dB floor (80 dB under the loudest frame) needs the whole file, so the flux
+    is formed after the scan."""
+
+    def __init__(self, sr):
+        self.sr, self.hop = sr, max(1, int(round(0.005 * sr)))
+        self.win = sg.get_window("hann", REF_NFFT).astype(np.float32)
+        self.mel = mel_filters(sr, REF_NFFT, REF_MELS).T.copy()
+        self.buf = np.zeros(REF_NFFT // 2, np.float32)
+        self.n_in, self.out = 0, []
+
+    def _frames(self):
+        n = (len(self.buf) - REF_NFFT) // self.hop + 1
+        if n <= 0:
+            return
+        fr = np.lib.stride_tricks.sliding_window_view(self.buf, REF_NFFT)[::self.hop][:n]
+        spec = np.abs(np.fft.rfft(fr * self.win, axis=1)) ** 2
+        self.out.append((spec.astype(np.float32) @ self.mel).astype(np.float32))
+        self.buf = self.buf[n * self.hop:]
+
+    def feed(self, y):
+        self.n_in += len(y)
+        self.buf = np.concatenate((self.buf, np.asarray(y, np.float32)))
+        self._frames()
+
+    def finish(self):
+        total = 1 + self.n_in // self.hop
+        self.buf = np.concatenate((self.buf, np.zeros(REF_NFFT // 2, np.float32)))
+        self._frames()
+        if not self.out or self.n_in < 512:
+            return np.zeros(0)
+        S = np.concatenate(self.out)[:total]
+        self.out = []
+        top = np.float32(10 * np.log10(max(1e-10, float(S.max())))) - np.float32(80.0)
+        env = np.zeros(len(S), np.float32)
+        lag_pad = 1 + REF_NFFT // (2 * self.hop)
+        prev = None
+        for s0 in range(0, len(S), 65536):                    # row blocks keep the dB temporaries small
+            blk = np.maximum(np.float32(10.0) * np.log10(np.maximum(np.float32(1e-10), S[s0:s0 + 65536])), top)
+            both = blk if prev is None else np.concatenate((prev, blk))
+            d = np.maximum(0, both[1:] - both[:-1]).mean(axis=1)
+            j0 = s0 + lag_pad if prev is None else s0 - 1 + lag_pad
+            m = min(len(d), len(env) - j0)
+            if m > 0:
+                env[j0:j0 + m] = d[:m]
+            prev = blk[-1:]
+        del S
+        env = env - env.min()
+        env /= env.max() + np.finfo(np.float32).tiny
+        w = lambda s: int(np.ceil(s * self.sr // self.hop))
+        pk = peak_pick(env, w(0.03), 1, w(0.10), w(0.10) + 1, 0.07, w(0.03))
+        return pk * self.hop / self.sr
+
+
 # ---------- pulse detection
 def comb(ac, lags):
     """mean autocorrelation at T, 2T, 3T, 4T"""
@@ -141,8 +273,16 @@ def acf(f):
     return c / (c[0] + 1e-12)
 
 
-def pulse_windows(f, step, win_s=16, hop_s=4, seed=1):
-    """for each window: best period, comb score, z-score against a block-shuffled null (periodicity destroyed, texture kept)"""
+def comb_at(ac, lag):
+    """comb() at a fractional lag (linear interpolation of the autocorrelation)"""
+    idx = np.arange(1, 5) * float(lag)
+    idx = idx[idx < len(ac) - 1]
+    return float(np.mean(np.interp(idx, np.arange(len(ac)), ac))) if len(idx) else 0.0
+
+
+def pulse_windows(f, step, win_s=16, hop_s=4, seed=1, acfs=None):
+    """for each window: best period, comb score, z-score against a block-shuffled null (periodicity destroyed, texture
+    kept). acfs: optional list that receives each window's autocorrelation (for the tempo candidates)"""
     rng = np.random.default_rng(seed)
     W, Hp = int(round(win_s / step)), int(round(hop_s / step))
     lags = np.arange(int(0.30 / step), int(1.25 / step))
@@ -152,7 +292,10 @@ def pulse_windows(f, step, win_s=16, hop_s=4, seed=1):
         return out
     for s in range(0, max(1, len(f) - W + 1), Hp):
         w = f[s:s + W]
-        c = comb(acf(w), lags)
+        a = acf(w)
+        if acfs is not None:
+            acfs.append(a.astype(np.float32))
+        c = comb(a, lags)
         k = int(np.argmax(c))
         nulls = []
         m = len(w) // block
@@ -174,11 +317,20 @@ def fold(T, bpm_min, bpm_max):
     return T
 
 
+def nearest_gap(t, ons):
+    """|t - nearest of the sorted times ons| for each t (O(n log m), no n x m matrix)"""
+    j = np.searchsorted(ons, t)
+    lo = ons[np.clip(j - 1, 0, len(ons) - 1)]
+    hi = ons[np.clip(j, 0, len(ons) - 1)]
+    return np.minimum(np.abs(t - lo), np.abs(hi - t))
+
+
 def agreement(times, ons, T, win=0.05):
     """fraction of beats within +-win of a reference onset, and the same at other phases of the period (chance at this density)"""
     if not len(ons):
         return 0.0, 0.0
-    near = lambda t: float(np.mean(np.min(np.abs(t[:, None] - ons[None, :]), axis=1) <= win))
+    ons = np.sort(np.asarray(ons, np.float64))
+    near = lambda t: float(np.mean(nearest_gap(t, ons) <= win))
     return near(times), float(np.mean([near(times + T * p) for p in np.arange(0.2, 0.9, 0.1)]))
 
 
@@ -230,6 +382,24 @@ def track_beats(f, t0, t1, T, thr, step, tol=0.14):
     return sorted(found.items())
 
 
+def tempo_candidates(acfs, step, bpm):
+    """the main tempo and its usual confusions (x2, x1/2, x3/2, x2/3, x4/3, x3/4), each with its onset-autocorrelation
+    support (median over the analysis windows of the comb score at that period) and a confidence relative to the best
+    candidate (1.0 = best supported). A human or an agent picks one; rig.tempo.bpm pins it."""
+    if not acfs or not bpm:
+        return []
+    rows = []
+    for label, r in CANDIDATE_RATIOS:
+        b = bpm * r
+        lag = 60.0 / b / step
+        sup = float(np.median([comb_at(a, lag) for a in acfs]))
+        rows.append({"ratio": label, "bpm": round(b, 2), "support": round(sup, 4)})
+    top = max(max(r["support"] for r in rows), 1e-9)
+    for r in rows:
+        r["confidence"] = round(max(0.0, r["support"]) / top, 3)
+    return sorted(rows, key=lambda r: (-r["confidence"], r["ratio"] != "x1"))
+
+
 def beat_grid(f, ref_ons, duration, s):
     """verified beats: [{time, strength, confidence}], accepted/rejected passages, bpm map, grid offset, pulse summary.
     time = (k + 1) * 5 ms, when the onset is known. With no proven pulse, the strongest window's folded period is used
@@ -238,7 +408,8 @@ def beat_grid(f, ref_ons, duration, s):
     # short clips: shrink the window so at least ~5 windows (3 are needed for a passage) fit
     win = min(s["win_s"], max(4.0, duration / 2))
     hop = min(s["hop_s"], win / 4)
-    wins = pulse_windows(f, step, win, hop)
+    acfs = []
+    wins = pulse_windows(f, step, win, hop, acfs=acfs)
     for w in wins:
         w["T"] = fold(w["T"], s["bpm_min"], s["bpm_max"])
     fp = f[f > 0]
@@ -307,8 +478,9 @@ def beat_grid(f, ref_ons, duration, s):
         grid_offset = tpk - np.floor(tpk / T0) * T0
         pulse = dict(confidence=0.0, covered=0.0, label="no proven pulse: tempo is a low-confidence estimate, no beats")
     pulse["windows_z_median"] = round(float(np.median([w["z"] for w in wins])), 1) if wins else None
+    main = max(pas, key=lambda p: p["end"] - p["start"])["bpm"] if pas else bpm_map[0]["bpm"]
     return dict(beats=beats, passages=pas, rejected_passages=rejected, bpm_map=bpm_map, grid_offset=round(float(grid_offset), 6),
-                fallback=fallback, pulse=pulse)
+                fallback=fallback, pulse=pulse, tempo_candidates=tempo_candidates(acfs, step, main))
 
 
 # ---------- specs
@@ -344,7 +516,7 @@ class Analysis:
         self.default_weights = default_weights
         st = os.stat(self.audio)
         self.ident = dict(audio=self.audio.replace("\\", "/"), size=st.st_size, mtime_ns=st.st_mtime_ns, version=ANALYSIS_VERSION,
-                          settings=self.settings)
+                          settings=self.settings, weights=None if default_weights is None else [float(x) for x in default_weights])
         self.ident_hash = hashlib.sha256(json.dumps(self.ident, sort_keys=True).encode()).hexdigest()
         self.arrays = {}
         self.meta = {}
@@ -376,13 +548,17 @@ class Analysis:
         return True
 
     def save(self):
+        """write the cache, only when an audio pass produced something new. Envelopes are cheap derivations of the
+        cached band power and stay in memory only, so editing attack/release never rewrites (or grows) the cache:
+        a cached analyze is a pure read."""
         if not self.dirty:
             return
         os.makedirs(self.cache_dir, exist_ok=True)
-        meta = dict(self.meta, ident=self.ident, ident_hash=self.ident_hash, arrays=sorted(self.arrays))
+        stored = {k: a for k, a in self.arrays.items() if not k.startswith("env:")}
+        meta = dict(self.meta, ident=self.ident, ident_hash=self.ident_hash, arrays=sorted(stored))
         tmp = self.npz_path + ".tmp"
         with open(tmp, "wb") as fh:
-            np.savez(fh, **self.arrays)
+            np.savez(fh, **stored)
         os.replace(tmp, self.npz_path)
         with open(self.json_path, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(meta, fh, indent=1, sort_keys=True)
@@ -402,7 +578,12 @@ class Analysis:
             peaks = []
             q = max(1, int(round(sr / 12000)))
             lp = sg.butter(6, 0.8 * sr / q / 2, fs=sr, output="sos")
-            lpzi, ref, pos = np.zeros((lp.shape[0], 2)), [], 0
+            lpzi, pos = np.zeros((lp.shape[0], 2)), 0
+            self._ref = RefFlux(sr / q)
+            mw = None                                         # onset mono: equal downmix unless channel_weights says otherwise
+            if self.default_weights is not None:
+                mw = weights_for(self.default_weights, C)
+                mw = mw / (mw.sum() or 1.0)
         for blk in sf.blocks(self.audio, blocksize=sr * CHUNK_S, dtype="float32", always_2d=True):
             x = blk.astype(np.float64)
             for s in st.values():
@@ -411,7 +592,7 @@ class Analysis:
                     y, s["zi"] = sg.sosfilt(s["sos"], x, axis=0, zi=s["zi"])
                 s["out"].append(grid_power(y, sr, STEP_MS) @ s["w"])
             if base:
-                mono = x.mean(axis=1)
+                mono = x.mean(axis=1) if mw is None else x @ mw
                 for o in octs:
                     yb, o["zi"] = sg.sosfilt(o["sos"], mono, zi=o["zi"])
                     o["out"].append(grid_power(yb, sr, HOP_MS))
@@ -420,7 +601,7 @@ class Analysis:
                     e = (np.arange(nb + 1) * sr * HOP_MS) // 1000
                     peaks.append(np.maximum.reduceat(np.abs(mono[:e[-1]]), e[:-1]))
                 yl, lpzi = sg.sosfilt(lp, mono, zi=lpzi)
-                ref.append(yl[(-pos) % q::q])
+                self._ref.feed(yl[(-pos) % q::q].astype(np.float32))
                 pos += len(mono)
         for k, s in st.items():
             self.arrays["pow:" + k] = _f32(np.concatenate(s["out"]) if s["out"] else np.zeros(0))
@@ -431,25 +612,11 @@ class Analysis:
                 f = flux(p) if not len(f) else f + flux(p)
             self.arrays["onset"] = _f32(f)
             self.arrays["peaks"] = _f32(np.concatenate(peaks) if peaks else np.zeros(0))
-            self._ref = (np.concatenate(ref).astype(np.float32) if ref else np.zeros(0, np.float32), sr / q)
         self.dirty = True
-
-    def _reference_onsets(self):
-        """independent onset list (librosa flux, ~21 ms window), used only to check our beats, never to place them"""
-        y, rsr = self._ref
-        if len(y) < 512:
-            return np.zeros(0)
-        import warnings
-        import librosa
-        hop = max(1, int(round(0.005 * rsr)))
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)        # librosa: empty mel filters at this small n_fft
-            env = librosa.onset.onset_strength(y=y, sr=rsr, n_fft=256, hop_length=hop, n_mels=40)
-            return librosa.onset.onset_detect(onset_envelope=env, sr=rsr, hop_length=hop, units="time", backtrack=False)
 
     def build_base(self):
         self._scan({}, base=True)
-        g = beat_grid(self.arrays["onset"].astype(np.float64), self._reference_onsets(), self.duration, self.settings)
+        g = beat_grid(self.arrays["onset"].astype(np.float64), self._ref.finish(), self.duration, self.settings)
         self.meta = dict(sr=self.sr, channels=self.channels, n_samples=self.n_samples, duration=round(self.duration, 6), **g)
         del self._ref
 
@@ -476,8 +643,10 @@ class Analysis:
         ek = f"env:{key}:{float(attack_ms):g}:{float(release_ms):g}"
         if ek not in self.arrays:
             self.ensure([(kind, lo, hi, weights)])
+            env_keys = [k for k in self.arrays if k.startswith("env:")]
+            for k in env_keys[:max(0, len(env_keys) - ENV_KEEP + 1)]:      # oldest first: bounded memory in a server
+                del self.arrays[k]
             self.arrays[ek] = _f32(follow(np.sqrt(self.arrays["pow:" + key].astype(np.float64)), attack_ms, release_ms, STEP_MS))
-            self.dirty = True
         return self.arrays[ek]
 
     def onset_fn(self, lo=None, hi=None, weights=None):
@@ -513,7 +682,86 @@ class Analysis:
         return dict(audio=self.ident["audio"], sr=self.sr, channels=self.channels, duration=m["duration"],
                     bpm=m["bpm_map"][0]["bpm"] if m["bpm_map"] else None, bpm_map=m["bpm_map"], grid_offset=m["grid_offset"],
                     fallback=m["fallback"], pulse=m["pulse"], passages=m["passages"], beats=m["beats"],
+                    tempo_candidates=m.get("tempo_candidates", []),
                     peaks_per_s=200 / n, peaks=np.round(pk, 4).tolist())
+
+
+# ---------- song sections (energy changes between bars)
+SECTION_BANDS = [("sub", 30, 60), ("kick", 40, 120), ("bass", 80, 250), ("lowmid", 250, 800), ("mid", 800, 2500),
+                 ("presence", 2500, 6000), ("air", 6000, 14000)]
+
+
+def band_levels(a, edges, t1, bands=SECTION_BANDS):
+    """[bands, windows] RMS level of each band per window [edges[i], edges[i+1] or t1), 0..1 on a dB scale over the
+    whole song (10th..99.5th percentile)"""
+    a.ensure([("band", lo, hi, None) for _, lo, hi in bands])
+    L = []
+    for _, lo, hi in bands:
+        env = a.envelope("band", lo, hi, 10, 150).astype(np.float64)
+        db = 20 * np.log10(env + 1e-9)
+        lo_db, hi_db = np.percentile(db, 10), np.percentile(db, 99.5)
+        ends = list(edges[1:]) + [t1]
+        row = []
+        for e0, e1 in zip(edges, ends):
+            seg = env[int(e0 * 1000):int(e1 * 1000)]
+            v = 20 * np.log10(np.sqrt(np.mean(seg ** 2)) + 1e-9) if len(seg) else lo_db
+            row.append(float(np.clip((v - lo_db) / max(hi_db - lo_db, 1e-6), 0, 1)))
+        L.append(row)
+    return np.array(L)
+
+
+def section_boundaries(a, window_s=None, min_windows=2):
+    """Candidate section boundaries: bar lines (windows of one bar from the grid offset, or window_s) where the band
+    levels change sharply (summed change >= 0.9 or one band >= 0.35, the rule describe_audio uses). Boundaries closer
+    than min_windows keep the stronger change. Returns (sections, levels): sections = [{"time", "level", "rose",
+    "fell"}] starting with time 0; level = the mean band level over the section. Energy changes, not labels."""
+    m = a.meta
+    dur = float(m["duration"])
+    bpm = m["bpm_map"][0]["bpm"] if m.get("bpm_map") else None
+    w = float(window_s) if window_s else (4 * 60.0 / bpm if bpm else 2.0)
+    g = float(m.get("grid_offset") or 0.0) % w
+    edges = np.arange(g, dur, w)
+    if g >= 0.25 * w:
+        edges = np.concatenate(([0.0], edges))               # a real pickup before the first bar line
+    elif len(edges):
+        edges[0] = 0.0                                       # a sliver before the first bar joins the first bar
+    if len(edges) < 2:
+        return [{"time": 0.0, "level": None, "rose": [], "fell": []}], None
+    L = band_levels(a, edges, dur)
+    names = [b[0] for b in SECTION_BANDS]
+    cands = []
+    for i in range(1, L.shape[1]):
+        d = L[:, i] - L[:, i - 1]
+        score = float(np.abs(d).sum())
+        if score >= 0.9 or np.abs(d).max() >= 0.35:
+            cands.append((i, score, d))
+    keep = []
+    for c in sorted(cands, key=lambda c: -c[1]):                 # strongest first; drop near neighbours
+        if all(abs(c[0] - k[0]) >= min_windows for k in keep):
+            keep.append(c)
+    keep.sort(key=lambda c: c[0])
+    starts = [0] + [k[0] for k in keep]
+    out = []
+    for j, s0 in enumerate(starts):
+        s1 = starts[j + 1] if j + 1 < len(starts) else L.shape[1]
+        d = keep[j - 1][2] if j else np.zeros(len(names))
+        out.append({"time": round(float(edges[s0]) if s0 else 0.0, 3), "level": round(float(L[:, s0:s1].mean()), 3),
+                    "rose": [names[k] for k in np.flatnonzero(d >= 0.2)], "fell": [names[k] for k in np.flatnonzero(d <= -0.2)]})
+    return out, L
+
+
+def name_sections(secs):
+    """heuristic, editable names from each section's energy relative to the song: the first is "intro", then
+    "breakdown" (clearly quieter than the median section), "peak" (clearly louder) or "main"; repeats get _2, _3"""
+    levels = [s["level"] for s in secs if s["level"] is not None]
+    med = float(np.median(levels)) if levels else 0.0
+    out, used = [], {}
+    for i, s in enumerate(secs):
+        lv = s["level"] if s["level"] is not None else med
+        base = "intro" if i == 0 else "breakdown" if lv < med - 0.12 else "peak" if lv > med + 0.12 else "main"
+        used[base] = used.get(base, 0) + 1
+        out.append({"name": base if used[base] == 1 else f"{base}_{used[base]}", "time": s["time"]})
+    return out
 
 
 def open_analysis(audio: str, cache_dir: str, settings: Optional[dict] = None, default_weights=None, use_cache: bool = True) -> "Analysis":

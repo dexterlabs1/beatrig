@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "beatrig"
-version = "0.1.0"
+version = "0.2.0"
 description = "A reactive engine for agents and artists: music in, deterministic animation keys out."
 readme = "README.md"
 license = "MIT"
@@ -26,11 +26,11 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "soundfile>=0.12",
-    "librosa>=0.10",
 ]
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.2"]
+stems = ["torch>=2.1", "demucs>=4.0"]
 dev = ["pytest>=7"]
 
 [project.scripts]

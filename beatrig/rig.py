@@ -75,6 +75,72 @@ class Rig:
     def node(self, nid):
         return next((n for n in self.nodes if n.get("id") == nid), None)
 
+    # -- v0.2: audio window, groups, scene
+    @property
+    def audio_in_s(self):
+        """audio time of frame `audio_offset_frames` (a window into a long file); 0 = the file's start"""
+        return float(self.data.get("audio_in_s") or 0.0)
+
+    @property
+    def audio_out_s(self):
+        v = self.data.get("audio_out_s")
+        return None if v is None else float(v)
+
+    @property
+    def groups(self):
+        g = self.data.get("groups")
+        return g if isinstance(g, dict) else {}
+
+    def expand_actors(self, actors):
+        """an actor list (or one "@group" string) with every "@group" entry replaced by its members, recursively;
+        unknown groups stay as written (check reports them)"""
+        def walk(items, seen):
+            out = []
+            for a in ([items] if isinstance(items, str) else list(items or [])):
+                if isinstance(a, str) and a.startswith("@") and a[1:] in self.groups and a[1:] not in seen:
+                    out.extend(walk(self.groups[a[1:]], seen | {a[1:]}))
+                else:
+                    out.append(a)
+            return out
+        return walk(actors, frozenset())
+
+    def resolved_nodes(self):
+        """the nodes with "@group" actor lists expanded (what evaluation and channel inference see)"""
+        out = []
+        for n in self.nodes:
+            if isinstance(n, dict) and n.get("actors") is not None:
+                n = dict(n, actors=self.expand_actors(n["actors"]))
+            out.append(n)
+        return out
+
+    def resolved_target(self, target):
+        t = dict(target or {})
+        if t.get("actors") is not None:
+            t["actors"] = self.expand_actors(t["actors"])
+        return t
+
+    @property
+    def scene_path(self):
+        return self.resolve(self.data.get("scene"))
+
+    def load_scene(self):
+        """the scene.json dict, or None when the rig has no "scene" (raises RigError if it is set but unreadable)"""
+        p = self.scene_path
+        if not p:
+            return None
+        try:
+            st = os.stat(p)
+            key = (p, st.st_size, st.st_mtime_ns)
+            if key not in _SCENES:
+                with open(p, encoding="utf-8") as fh:
+                    _SCENES[key] = json.load(fh)
+            return _SCENES[key]
+        except (OSError, json.JSONDecodeError) as e:
+            raise RigError(f"scene {p}: {e}") from None
+
+
+_SCENES = {}
+
 
 def load_rig(path: str) -> Rig:
     """read rig.json; raises RigError on invalid JSON"""

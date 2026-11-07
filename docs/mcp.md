@@ -52,9 +52,10 @@ Conventions:
 | Tool | Args | Returns |
 |---|---|---|
 | `bake` | `rig_path`, `out` | writes `bake.json` (default next to the rig); per output: target kind, channels, min, max, mean, key count, hit count |
-| `plot` | `rig_path`, `output_id`, `start_s`, `end_s`, `channels`, `width` | a PNG image plus a JSON caption. Top lane: the waveform. One lane per channel (up to 16; pick with actor names or indexes): the value curve as Sequencer will interpolate it (lane floor = output `min`, top = `max`), orange ticks at trigger hits, dark dots at baked keys. Grey lines are beats, darker every fourth. |
+| `plot` | `rig_path`, `output_id`, `start_s`, `end_s`, `channels`, `width` | a PNG image plus a JSON caption. Top lane: the waveform. One lane per channel (up to 16; pick with actor names or indexes): the value curve as Sequencer will interpolate it (lane floor = output `min`, top = `max`), orange ticks at trigger hits, dark dots at baked keys. Grey lines are beats, darker every fourth. A red bar along a lane's top marks where that channel flashes faster than the rig's flash-safety limit; the caption's `flash_safety` block gives the limit and, per channel, `ok`, `max_per_s` and the spans in seconds. Colour outputs are drawn as luminance (Rec. 709 of linear RGB), which is also what the safety check judges. |
 
-`plot` draws with numpy and zlib only (no plotting library), so the image is the same on every machine.
+`plot` draws with numpy and zlib only (no plotting library), so the image is the same on every machine. The flash
+overlay comes from `beatrig.safety.flash_report`; without that module the plot is drawn without it.
 
 ## Preview page
 
@@ -67,10 +68,16 @@ Conventions:
 
 | Tool | Args | Notes |
 |---|---|---|
-| `ue_apply` | `bake_path`, `sequence_path`, `host`, `start_frame`, `only`, `save` | runs `ue/beatrig_apply.py apply` in the editor. `sequence_path` is an asset path like `/Game/Show/LS_Main`. `start_frame` = the sequence frame of bake frame 0. |
-| `ue_check` | `bake_path`, `sequence_path`, `host`, `start_frame`, `only` | reads keys back and compares them with the bake |
-| `ue_undo` | `sequence_path`, `output_id`, `host`, `save` | removes beatrig's tracks (all, or one output's) |
+| `ue_scan` | `out`, `rig_path`, `host`, `paths` | scans the level open in the editor and writes `scene.json` to `out`, or next to `rig_path` (the rig's `"scene"` file if it names one). Returns a summary: actor names by component kind (light, mesh, niagara, camera), material parameter names with how many meshes have them, MPCs with their scalar/vector parameters, Level Sequences, and the camera (an OWL 360 dome camera's `projection` and `dome_angle`). Use these names in outputs. |
+| `ue_apply` | `bake_path`, `sequence_path`, `host`, `start_frame`, `only`, `save` | writes the bake into a Level Sequence (asset path like `/Game/Show/LS_Main`). `start_frame` = the sequence frame of bake frame 0. Returns track and key counts, binding counts and timings. |
+| `ue_check` | `bake_path`, `sequence_path`, `host`, `start_frame`, `only` | reads the keys back and compares them with the bake, key for key (colour tracks: all four channels; Niagara tracks: the parameter name too). Returns the failing tracks only. |
+| `ue_undo` | `sequence_path`, `output_id`, `host`, `save` | removes beatrig's tracks (all, or one output's) and the bindings beatrig created that are now empty |
+| `live_push` | `bake_path`, `sequence_path`, `only_changed`, `start_frame`, `host` | rewrites only the outputs whose keys changed since this server's last push to that sequence; outputs gone from the bake are removed. Re-evaluates the sequence if it is open in Sequencer. Returns `pushed`, `skipped`, `removed` (output ids) and `ms`. |
+| `playhead_get` | `host` | the sequence open in Sequencer, playhead frame, playing, fps, range |
+| `playhead_set` | `frame`, `playing`, `sequence_path`, `host` | jump the playhead and/or play/pause; `sequence_path` opens that sequence in Sequencer first (replacing what it showed) |
 
-`host` defaults to `BEATRIG_UE_HOST` or `127.0.0.1:30010`. The editor must be able to read the bake and the applier
-at the same paths, so it has to run on the same machine. Setup and the tick-time details: [unreal.md](unreal.md).
-These three are untested against a live editor.
+`host` defaults to `BEATRIG_UE_HOST` or `127.0.0.1:30010`. All seven go through one persistent `beatrig.live.Link` per
+host (applier imported once, keep-alive connection), so they cost tens of milliseconds each. The MCP server leaves the
+editor's "Use Less CPU when in Background" setting alone; with it on and the editor in the background each call takes
+about 330 ms. The editor reads beatrig's temp files, so it has to run on the same machine. Tested against UE 5.8.3;
+setup, what is written for each target kind, timings and gotchas: [unreal.md](unreal.md).

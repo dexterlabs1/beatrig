@@ -1,7 +1,8 @@
 """Writes the preview page's dev fixture: a synthetic drum loop (loop.wav) plus rig.json and notes.json.
 
-Only for developing the page without the engine (BEATRIG_FAKE=1). Stdlib only, deterministic (fixed seed).
+A small rig for working on the page: stdlib only, deterministic (fixed seed).
     py -3 web/dev/make_fixture.py
+    py -3 beatrig.py serve web/dev/rig.json --port 4701
 """
 import json
 import math

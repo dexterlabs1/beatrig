@@ -1,16 +1,27 @@
-"""Static rig validation: unknown ops/params, missing refs, cycles, channel counts vs targets, and the timing/easing rules
-(rule 1: nothing ahead of the audio; rule 2: only trigger envelopes may move instantly). Needs no audio."""
+"""Static rig validation: unknown ops/params, missing refs, cycles, channel counts vs targets, colour vs value signals,
+groups and scene references, and the timing/easing rules (rule 1: nothing ahead of the audio; rule 2: only trigger
+envelopes may move instantly). Needs no audio. Given a bake result it also reports flash-safety violations."""
 from typing import Optional
 
 from .ops import SPECS, REQ, COMMON, LFO_SHAPES, MATH, CYCLE_ORDERS, CURVE_PRESETS, input_ids
 from .signal import SHAPES
 
 TOP_KEYS = {"audio", "fps", "frames", "audio_offset_frames", "tempo", "seed", "nodes", "layers", "outputs", "bake",
-            "channel_weights", "notes", "analysis", "name", "description", "comment"}
-TARGETS = {"light": ("actors",), "material": ("actors", "param"), "niagara": ("actors", "param"), "mpc": ("asset", "param")}
+            "channel_weights", "notes", "analysis", "name", "description", "comment",
+            "scene", "groups", "safety", "audio_in_s", "audio_out_s"}
+TARGETS = {"light": ("actors",), "material": ("actors", "param"), "niagara": ("actors", "param"), "mpc": ("asset", "param"),
+           "transform": ("actors", "property")}
+TRANSFORM_AXES = {"location": ["x", "y", "z"], "rotation": ["roll", "pitch", "yaw"], "scale": ["x", "y", "z"]}
+COLOR_TARGETS = ("mpc", "light", "material")
 EASES = {"in_out", "in", "out", "linear"}
 ENUMS = {("lfo", "shape"): LFO_SHAPES, ("envelope", "shape"): SHAPES, ("math", "fn"): MATH, ("cycle", "order"): CYCLE_ORDERS,
-         ("merge", "fn"): ["max", "mean"], ("curve", "preset"): list(CURVE_PRESETS)}
+         ("merge", "fn"): ["max", "mean"], ("curve", "preset"): list(CURVE_PRESETS),
+         ("shuffle_hits", "mode"): ["bag", "random"], ("spatial_delay", "shape"): ["point", "axis", "plane"],
+         ("spatial_delay", "direction"): ["out", "in"], ("dome_wave", "mode"): ["zenith_rings", "azimuth_sweep"],
+         ("flash_limit", "mode"): ["drop", "delay"]}
+TRIGGER_IN = ("envelope", "cycle", "push", "shuffle_hits", "every_n", "probability", "quantize")
+SPATIAL = ("spatial_delay", "dome_wave")
+SAFETY_KEYS = {"max_flashes_per_s", "min_swing", "outputs"}
 
 
 class CycleError(Exception):
@@ -37,8 +48,10 @@ def _num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def check(rig, notes: Optional[dict] = None) -> list:
-    """Validate a Rig. Returns [{"level": "error"|"warning", "where": str, "msg": str}]; bake refuses on any error."""
+def check(rig, notes: Optional[dict] = None, bake: Optional[dict] = None) -> list:
+    """Validate a Rig. Returns [{"level": "error"|"warning", "where": str, "msg": str}]; bake refuses on any error.
+    notes: also check note tracks, patterns and section names. bake: a bake result whose values get the flash-safety
+    check (errors with a rig "safety" block, warnings without)."""
     d = rig.data
     issues = []
     def err(where, msg):
@@ -57,6 +70,14 @@ def check(rig, notes: Optional[dict] = None) -> list:
         err("rig.frames", "must be a positive integer or null")
     if d.get("audio") is None and d.get("frames") is None:
         err("rig", "no audio: set frames")
+    for k in ("audio_in_s", "audio_out_s"):
+        if d.get(k) is not None and (not _num(d[k]) or d[k] < 0):
+            err(f"rig.{k}", "must be a number of seconds >= 0")
+    if _num(d.get("audio_in_s")) and _num(d.get("audio_out_s")) and d["audio_out_s"] <= d["audio_in_s"]:
+        err("rig.audio_out_s", "must be after audio_in_s")
+    cw = d.get("channel_weights")
+    if cw is not None and (not isinstance(cw, list) or not cw or not all(_num(x) and x >= 0 for x in cw) or not any(cw)):
+        err("rig.channel_weights", "must be a list of weights >= 0, one per audio channel (e.g. 5.1: [1, 1, 1, 0.5, 0.7, 0.7])")
     tempo = d.get("tempo") or {}
     if tempo.get("bpm") is not None and (not _num(tempo["bpm"]) or tempo["bpm"] <= 0):
         err("rig.tempo.bpm", "bpm must be > 0")
@@ -66,9 +87,42 @@ def check(rig, notes: Optional[dict] = None) -> list:
     tol = (d.get("bake") or {}).get("key_tolerance", 0.002)
     if not _num(tol) or tol < 0:
         err("rig.bake.key_tolerance", "must be >= 0")
+    sf = d.get("safety")
+    if sf is not None:
+        if not isinstance(sf, dict):
+            err("rig.safety", "must be an object {max_flashes_per_s, min_swing, outputs}")
+        else:
+            for k in sf:
+                if k not in SAFETY_KEYS and not k.startswith("_"):
+                    err("rig.safety", f"unknown key {k!r}")
+            for k in ("max_flashes_per_s", "min_swing"):
+                if k in sf and (not _num(sf[k]) or sf[k] <= 0):
+                    err(f"rig.safety.{k}", "must be > 0")
+            o = sf.get("outputs", "auto")
+            if not (o in ("auto", "all", "none") or (isinstance(o, list) and all(isinstance(x, str) for x in o))):
+                err("rig.safety.outputs", "must be \"auto\", \"all\", \"none\" or a list of output ids")
 
-    nodes = d.get("nodes", [])
-    ids = [n.get("id") for n in nodes]
+    groups = d.get("groups")
+    if groups is not None and (not isinstance(groups, dict)
+                               or not all(isinstance(v, list) and all(isinstance(a, str) for a in v) for v in groups.values())):
+        err("rig.groups", "must be {name: [actor, ...]}")
+        groups = {}
+    groups = groups or {}
+
+    def unknown_groups(actors):
+        items = [actors] if isinstance(actors, str) else (actors or [])
+        return [a for a in items if isinstance(a, str) and a.startswith("@") and a[1:] not in groups]
+
+    scene = None
+    try:
+        scene = rig.load_scene()
+    except Exception as e:                                         # RigError: unreadable or missing scene.json
+        err("rig.scene", str(e))
+    scene_actors = (scene or {}).get("actors") or {}
+
+    raw_nodes = d.get("nodes", [])
+    nodes = rig.resolved_nodes() if hasattr(rig, "resolved_nodes") else raw_nodes
+    ids = [n.get("id") for n in raw_nodes]
     by_id = {}
     for i, n in enumerate(nodes):
         nid = n.get("id")
@@ -93,8 +147,8 @@ def check(rig, notes: Optional[dict] = None) -> list:
             got = [g for g in group if n.get(g) is not None]
             if n["op"] == "delay" and group == ("ms", "beats") and not got:
                 err(where, "needs ms or beats")
-            if n["op"] == "chase" and not got:
-                err(where, "needs step_ms or step_beats")
+            if n["op"] in ("chase", "spatial_delay", "dome_wave") and not got:
+                err(where, f"needs {group[0]} or {group[1]}")
             if len(got) > 1:
                 err(where, f"give one of {list(group)}, not both")
         for (o, k), allowed in ENUMS.items():
@@ -109,10 +163,17 @@ def check(rig, notes: Optional[dict] = None) -> list:
         for ref in input_ids(n):
             if ref not in ids:
                 err(where, f"input {ref!r} does not exist")
+        raw = next((r for r in raw_nodes if r.get("id") == nid), n)
+        bad = unknown_groups(raw.get("actors"))
+        if bad:
+            err(where, f"unknown group(s) {bad} (define them in rig.groups)")
         # rule 1: no negative delays
-        for k in ("ms", "beats", "step_ms", "step_beats"):
-            if n["op"] in ("delay", "chase", "ripple") and n.get(k) is not None and (not _num(n[k]) or n[k] < 0):
+        for k in ("ms", "beats", "step_ms", "step_beats", "speed_cm_s", "beats_per_m", "deg_per_s", "deg_per_beat"):
+            if n["op"] in ("delay", "chase", "ripple") + SPATIAL and n.get(k) is not None and (not _num(n[k]) or n[k] < 0):
                 err(where, f"{k} must be >= 0 (rule 1: nothing ahead of the audio; use direction for reverse chases)")
+        for k in ("speed_cm_s", "deg_per_s"):
+            if n.get(k) == 0 and n["op"] in SPATIAL:
+                err(where, f"{k} must be > 0")
         # rule 2: eased motion
         if n["op"] == "smooth":
             for k in ("attack_ms", "release_ms"):
@@ -132,9 +193,9 @@ def check(rig, notes: Optional[dict] = None) -> list:
             err(where, "gamma must be > 0")
         if n["op"] == "envelope" and n.get("shape") == "custom" and not n.get("points"):
             err(where, "custom shape needs points")
-        for k in ("channels",):
-            if n["op"] in ("lfo", "const", "fanout", "chase", "cycle") and n.get(k) is not None and (not isinstance(n[k], int) or n[k] < 1):
-                err(where, "channels must be an integer >= 1")
+        if n["op"] in ("lfo", "const", "fanout", "chase", "cycle", "push", "shuffle_hits", "palette_cycle") and n.get("channels") is not None \
+                and (not isinstance(n["channels"], int) or n["channels"] < 1):
+            err(where, "channels must be an integer >= 1")
         if n["op"] == "notes" and notes is not None and n.get("track") not in (notes.get("tracks") or {}):
             warn(where, f"track {n.get('track')!r} not in notes.json (run notes init)")
         if n["op"] == "onsets":
@@ -143,6 +204,9 @@ def check(rig, notes: Optional[dict] = None) -> list:
                 err(where, f"in={ref!r} must be a band node or a {{lo, hi}} spec")
             elif isinstance(ref, str) and ref not in ids:
                 err(where, f"input {ref!r} does not exist")
+        if n.get("stem") is not None and n.get("stem") not in ("drums", "bass", "vocals", "other"):
+            err(where, f"stem {n['stem']!r} not in ['drums', 'bass', 'vocals', 'other']")
+        _check_v02_node(n, where, err, warn, scene, scene_actors)
 
     # cycles + static channel / kind inference
     chans, kinds = {}, {}
@@ -167,17 +231,43 @@ def check(rig, notes: Optional[dict] = None) -> list:
             kinds[n["id"]] = spec.kind(n, k_in) if callable(spec.kind) else spec.kind
         except (TypeError, ValueError, KeyError):
             continue
-        if n["op"] in ("envelope", "cycle") and k_in and k_in[0] != "trigger":
-            err(where, f"{n['op']} needs a trigger input; put a threshold op in front of {ins[0]!r}")
-        if n["op"] == "math" and c_in and any(c not in (1, max(c_in)) for c in c_in):
+        op = n["op"]
+        if "color" in k_in and not spec.color:
+            err(where, f"{op} does not take colour signals ({[i for i, k in zip(ins, k_in) if k == 'color']} are colour); "
+                       "use scale_color / mix_color, or gradient after the value ops")
+        if op in ("mix_color", "scale_color") and k_in:
+            want = ["color", "color"] + (["value"] if len(k_in) == 3 else []) if op == "mix_color" else ["color", "value"]
+            if op == "mix_color" and len(k_in) not in (2, 3):
+                err(where, "mix_color takes in = [a, b] or [a, b, t]")
+            elif op == "scale_color" and len(k_in) != 2:
+                err(where, "scale_color takes in = [colour, value]")
+            elif [k == "color" for k in k_in] != [w == "color" for w in want]:
+                err(where, f"{op} inputs must be {want} signals, got {k_in}")
+        if op == "gradient" and k_in and k_in[0] == "color":
+            err(where, "gradient takes a value signal, not a colour")
+        if op in TRIGGER_IN and k_in and k_in[0] != "trigger":
+            err(where, f"{op} needs a trigger input; put a threshold op in front of {ins[0]!r}")
+        if op == "math" and c_in and any(c not in (1, max(c_in)) for c in c_in):
             err(where, f"channel counts {c_in} don't broadcast (each must be 1 or {max(c_in)})")
-        if n["op"] == "chase" and c_in and c_in[0] not in (1, chans[n["id"]]):
+        if op in ("mix_color", "scale_color") and c_in and any(c not in (1, max(c_in)) for c in c_in):
+            err(where, f"channel counts {c_in} don't broadcast (each must be 1 or {max(c_in)})")
+        if op == "chase" and c_in and c_in[0] not in (1, chans[n["id"]]):
             err(where, f"input has {c_in[0]} channels, expected 1 or {chans[n['id']]}")
-        if n["op"] == "fanout" and c_in and c_in[0] != 1:
+        if op in SPATIAL and c_in and c_in[0] not in (1, chans[n["id"]]):
+            err(where, f"input has {c_in[0]} channels, expected 1 or {chans[n['id']]} (one per actor)")
+        if op == "ripple" and n.get("neighbours") == "knn" and c_in and n.get("actors") and c_in[0] != len(n["actors"]):
+            err(where, f"ripple knn: input has {c_in[0]} channels but {len(n['actors'])} actors")
+        if op == "fanout" and c_in and c_in[0] != 1:
             err(where, f"fanout needs a 1-channel input, got {c_in[0]}")
-        if n["op"] == "select" and c_in and any(not isinstance(i, int) or not 0 <= i < c_in[0] for i in n.get("channels") or []):
+        if op == "select" and c_in and any(not isinstance(i, int) or not 0 <= i < c_in[0] for i in n.get("channels") or []):
             err(where, f"select {n.get('channels')} out of range for {c_in[0]} channels")
+        if op == "push" and isinstance(n.get("pattern"), list) and isinstance(n.get("channels"), int):
+            C = n["channels"]
+            flat = [c for st in n["pattern"] for c in ([st] if isinstance(st, int) else (st if isinstance(st, list) else [None]))]
+            if not n["pattern"] or any(not isinstance(c, int) or not 0 <= c < C for c in flat):
+                err(where, f"pattern steps must be channels 0..{C - 1} (ints or lists of ints)")
 
+    sec_names = {str(x.get("name")) for x in (notes or {}).get("sections") or []} if notes is not None else None
     layers = d.get("layers", [])
     lids = set()
     for i, L in enumerate(layers):
@@ -187,16 +277,22 @@ def check(rig, notes: Optional[dict] = None) -> list:
             err(where, "missing or duplicate id")
         lids.add(lid)
         keys = L.get("intensity", [])
-        frames = [k.get("frame") for k in keys]
         if not keys:
             warn(where, "no intensity keys (treated as 1)")
-        if any(not _num(f) for f in frames) or frames != sorted(frames):
-            err(where, "intensity keys need numeric frames in ascending order")
+        for k in keys:
+            if k.get("section") is not None and k.get("frame") is None:
+                if sec_names is not None and str(k["section"]) not in sec_names:
+                    err(where, f"key names section {k['section']!r}, which is not in notes.json sections")
+            elif not _num(k.get("frame")):
+                err(where, "every intensity key needs a numeric frame or a section name")
+        frames = [k.get("frame") for k in keys if k.get("section") is None or k.get("frame") is not None]
+        if all(_num(f) for f in frames) and frames != sorted(frames):
+            err(where, "intensity keys need frames in ascending order")
         for j, k in enumerate(keys):
             if k.get("ease") is not None and k["ease"] not in EASES:
                 err(where, f"ease {k['ease']!r} not in {sorted(EASES)}")
             if j > 0 and not k.get("fade_frames"):
-                warn(where, f"key at frame {k.get('frame')} has no fade_frames: an instant switch (rule 2)")
+                warn(where, f"key at {k.get('section') or k.get('frame')} has no fade_frames: an instant switch (rule 2)")
 
     seen_targets = {}
     oids = set()
@@ -222,22 +318,161 @@ def check(rig, notes: Optional[dict] = None) -> list:
         for k in ("min", "max"):
             if o.get(k) is not None and not _num(o[k]):
                 err(where, f"{k} must be a number")
-        c = chans.get(sig)
+        bad = unknown_groups(t.get("actors"))
+        if bad:
+            err(where, f"unknown group(s) {bad} (define them in rig.groups)")
+        actors = rig.expand_actors(t.get("actors")) if hasattr(rig, "expand_actors") else list(t.get("actors") or [])
+        c, sk = chans.get(sig), kinds.get(sig)
+        wants_color = o.get("value_type") == "color" or t.get("value_type") == "color" or \
+            (kind == "light" and str(t.get("property", "")).lower() == "color")
+        for vt in (o.get("value_type"), t.get("value_type")):
+            if vt is not None and vt not in ("float", "color"):
+                err(where, f"value_type {vt!r} not in ['float', 'color']")
+        if sk == "color":
+            if kind not in COLOR_TARGETS:
+                err(where, f"signal {sig!r} is a colour; {kind} targets take values (colour goes to mpc, light or material)")
+            elif kind == "light" and str(t.get("property", "intensity")).lower() != "color":
+                err(where, f"signal {sig!r} is a colour: set the light target's property to \"color\"")
+            if o.get("min") is not None or o.get("max") is not None:
+                warn(where, "min/max are ignored for colour outputs (scale brightness in the graph: scale_color)")
+        elif wants_color and sk is not None:
+            err(where, f"a colour target needs a colour signal; {sig!r} is a {sk} (use gradient or palette_cycle)")
+        if kind == "transform":
+            prop, axis = t.get("property"), t.get("axis")
+            if prop not in TRANSFORM_AXES:
+                err(where, f"transform property {prop!r} not in {sorted(TRANSFORM_AXES)}")
+            elif axis not in TRANSFORM_AXES[prop]:
+                err(where, f"transform axis {axis!r} for {prop} not in {TRANSFORM_AXES[prop]}")
+            if t.get("additive") is not None and not isinstance(t["additive"], bool):
+                err(where, "additive must be true or false")
         if kind == "mpc":
             if c is not None and c != 1:
                 err(where, f"signal {sig!r} has {c} channels; an MPC param takes 1 (merge or select first)")
             tk = [("mpc", t.get("asset"), t.get("param"))]
         else:
-            actors = t.get("actors") or []
             if c is not None and actors and c not in (1, len(actors)):
                 err(where, f"signal {sig!r} has {c} channels but the target has {len(actors)} actors (need 1 or {len(actors)})")
             prop = t.get("param") or t.get("property", "intensity")
+            if kind == "transform":
+                prop = f"{t.get('property')}.{t.get('axis')}"
             tk = [(kind, a, prop) for a in actors]
         for key in tk:
             if key in seen_targets:
                 warn(where, f"{key[1]}.{key[2]} is also driven by output {seen_targets[key]!r}: the applier would write two tracks")
             seen_targets.setdefault(key, oid)
+        if scene is not None:
+            _check_scene_target(where, kind, t, actors, sk == "color" or wants_color, scene, warn)
+
+    if notes is not None:
+        pats = notes.get("patterns") or {}
+        for name, items in (notes.get("tracks") or {}).items():
+            for h in items:
+                if isinstance(h, dict) and "pattern" in h and "time" not in h and h["pattern"] not in pats:
+                    warn(f"notes track {name}", f"placement of unknown pattern {h['pattern']!r}")
+    if bake is not None:
+        from .safety import check_bake
+        issues.extend(check_bake(d, bake)[0])
     return issues
+
+
+def _check_v02_node(n, where, err, warn, scene, scene_actors):
+    """params of the colour / flow / spatial / safety ops that need more than an enum"""
+    op = n["op"]
+    if op in ("gradient", "palette_cycle"):
+        from .color import check_color_node
+        for e in check_color_node(n):
+            err(where, e)
+    if op == "palette_cycle" and n.get("period_beats") is None and n.get("period_s") is None:
+        err(where, "needs period_beats or period_s")
+    for k in ("period_beats", "period_s"):
+        if op == "palette_cycle" and n.get(k) is not None and (not _num(n[k]) or n[k] <= 0):
+            err(where, f"{k} must be > 0")
+    if op == "push" and isinstance(n.get("pattern"), str):
+        from .flow import PUSH_PATTERNS
+        if n["pattern"] not in PUSH_PATTERNS:
+            err(where, f"pattern {n['pattern']!r} not in {PUSH_PATTERNS} (or give a list of steps)")
+    if op == "every_n" and n.get("n") is not None and (not isinstance(n["n"], int) or n["n"] < 1):
+        err(where, "n must be an integer >= 1")
+    if op == "probability" and n.get("p") is not None and (not _num(n["p"]) or not 0 <= n["p"] <= 1):
+        err(where, "p must be within 0..1")
+    if op == "quantize":
+        from .notes import parse_grid
+        try:
+            if parse_grid(n.get("grid", "1/16")) <= 0:
+                raise ValueError
+        except (ValueError, ZeroDivisionError):
+            err(where, f"grid {n.get('grid')!r} is not a grid like '1/16' or a number of beats")
+    if op == "accumulate" and n.get("wrap"):
+        warn(where, "wrap jumps back instantly at every wrap (rule 2); fine for a shader phase, not for a transform")
+    if op == "flash_limit":
+        for k in ("max_flashes_per_s", "min_swing"):
+            if n.get(k) is not None and (not _num(n[k]) or n[k] <= 0):
+                err(where, f"{k} must be > 0")
+    if op == "ripple":
+        nb = n.get("neighbours", 2)
+        if nb == "knn":
+            if not n.get("actors"):
+                err(where, "neighbours \"knn\" needs actors (their scene positions define the neighbours)")
+            for k in ("k", "hops"):
+                if n.get(k) is not None and (not isinstance(n[k], int) or n[k] < 1):
+                    err(where, f"{k} must be an integer >= 1")
+        elif not isinstance(nb, int) or nb < 0:
+            err(where, "neighbours must be an integer >= 0 or \"knn\"")
+    if op in SPATIAL or (op == "ripple" and n.get("neighbours") == "knn"):
+        if scene is None:
+            err(where, f"{op} needs real positions: set the rig's \"scene\" to a scene.json")
+        else:
+            missing = [a for a in n.get("actors") or [] if a not in scene_actors or not scene_actors[a].get("location")]
+            if missing:
+                err(where, f"actors not in the scene (or without a location): {missing[:6]}")
+            if op == "spatial_delay" and isinstance(n.get("origin"), str) and n["origin"] not in scene_actors:
+                err(where, f"origin actor {n['origin']!r} is not in the scene")
+    if op == "spatial_delay" and n.get("origin") is not None and not isinstance(n["origin"], str) \
+            and not (isinstance(n["origin"], list) and len(n["origin"]) == 3 and all(_num(x) for x in n["origin"])):
+        err(where, "origin must be an actor name or [x, y, z] (cm)")
+    if op == "dome_wave":
+        cam = n.get("camera") or (scene or {}).get("camera")
+        if n.get("direction") is not None:
+            ok = ["out", "in"] if n.get("mode", "zenith_rings") == "zenith_rings" else ["cw", "ccw"]
+            if n["direction"] not in ok:
+                err(where, f"direction {n['direction']!r} not in {ok} for mode {n.get('mode', 'zenith_rings')}")
+        if not cam:
+            err(where, "needs a dome camera: scene.json \"camera\" or the node's \"camera\" {location, rotation}")
+        elif scene_actors:
+            from .spatial import outside_dome
+            out = outside_dome(cam, scene_actors, n.get("actors") or [])
+            if out:
+                warn(where, f"{len(out)} actor(s) are outside the dome's field of view, e.g. {out[:3]} (zenith deg)")
+
+
+def _check_scene_target(where, kind, t, actors, color, scene, warn):
+    """warnings for names the scene scan doesn't know: actors, light components, material params, MPCs"""
+    sa = scene.get("actors") or {}
+    if kind == "mpc":
+        mpcs = scene.get("mpcs") or {}
+        asset = t.get("asset")
+        if mpcs and asset not in mpcs:
+            warn(where, f"MPC {asset!r} is not in the scene scan")
+        elif asset in mpcs:
+            names = mpcs[asset].get("vectors" if color else "scalars") or []
+            if t.get("param") not in names:
+                warn(where, f"MPC {asset} has no {'vector' if color else 'scalar'} param {t.get('param')!r} (scan lists {names[:8]})")
+        return
+    missing = [a for a in actors if a not in sa]
+    if missing:
+        warn(where, f"{len(missing)} actor(s) not in the scene scan, e.g. {missing[:4]}")
+    for a in actors:
+        comps = (sa.get(a) or {}).get("components") or []
+        if a not in sa or not comps:
+            continue
+        if kind == "light" and not any(c.get("kind") == "light" for c in comps):
+            warn(where, f"{a} has no light component in the scan")
+            break
+        if kind == "material":
+            names = {p for c in comps for m in c.get("materials") or [] for p in (m.get("vectors" if color else "scalars") or [])}
+            if names and t.get("param") not in names:
+                warn(where, f"{a} has no material {'vector' if color else 'scalar'} param {t.get('param')!r} in the scan")
+                break
 
 
 def P_ok(n, k):

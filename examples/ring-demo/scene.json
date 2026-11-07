@@ -1,0 +1,474 @@
+{
+ "version": 1,
+ "source": "example",
+ "level": "/Game/Beatrig/L_Demo",
+ "units": "cm",
+ "actors": {
+  "Light_0": {
+   "class": "PointLight",
+   "location": [
+    800.0,
+    0.0,
+    450.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "LightComponent0",
+     "class": "PointLightComponent",
+     "kind": "light"
+    }
+   ]
+  },
+  "Light_1": {
+   "class": "PointLight",
+   "location": [
+    565.7,
+    565.7,
+    450.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "LightComponent0",
+     "class": "PointLightComponent",
+     "kind": "light"
+    }
+   ]
+  },
+  "Light_2": {
+   "class": "PointLight",
+   "location": [
+    0.0,
+    800.0,
+    450.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "LightComponent0",
+     "class": "PointLightComponent",
+     "kind": "light"
+    }
+   ]
+  },
+  "Light_3": {
+   "class": "PointLight",
+   "location": [
+    -565.7,
+    565.7,
+    450.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "LightComponent0",
+     "class": "PointLightComponent",
+     "kind": "light"
+    }
+   ]
+  },
+  "Light_4": {
+   "class": "PointLight",
+   "location": [
+    -800.0,
+    0.0,
+    450.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "LightComponent0",
+     "class": "PointLightComponent",
+     "kind": "light"
+    }
+   ]
+  },
+  "Light_5": {
+   "class": "PointLight",
+   "location": [
+    -565.7,
+    -565.7,
+    450.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "LightComponent0",
+     "class": "PointLightComponent",
+     "kind": "light"
+    }
+   ]
+  },
+  "Light_6": {
+   "class": "PointLight",
+   "location": [
+    -0.0,
+    -800.0,
+    450.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "LightComponent0",
+     "class": "PointLightComponent",
+     "kind": "light"
+    }
+   ]
+  },
+  "Light_7": {
+   "class": "PointLight",
+   "location": [
+    565.7,
+    -565.7,
+    450.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "LightComponent0",
+     "class": "PointLightComponent",
+     "kind": "light"
+    }
+   ]
+  },
+  "Orb_0": {
+   "class": "StaticMeshActor",
+   "location": [
+    351.1,
+    145.4,
+    900.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "StaticMeshComponent0",
+     "class": "StaticMeshComponent",
+     "kind": "mesh",
+     "materials": [
+      {
+       "slot": 0,
+       "scalars": [
+        "Glow"
+       ],
+       "vectors": [
+        "Color"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "Orb_1": {
+   "class": "StaticMeshActor",
+   "location": [
+    145.4,
+    351.1,
+    900.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "StaticMeshComponent0",
+     "class": "StaticMeshComponent",
+     "kind": "mesh",
+     "materials": [
+      {
+       "slot": 0,
+       "scalars": [
+        "Glow"
+       ],
+       "vectors": [
+        "Color"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "Orb_2": {
+   "class": "StaticMeshActor",
+   "location": [
+    -145.4,
+    351.1,
+    900.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "StaticMeshComponent0",
+     "class": "StaticMeshComponent",
+     "kind": "mesh",
+     "materials": [
+      {
+       "slot": 0,
+       "scalars": [
+        "Glow"
+       ],
+       "vectors": [
+        "Color"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "Orb_3": {
+   "class": "StaticMeshActor",
+   "location": [
+    -351.1,
+    145.4,
+    900.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "StaticMeshComponent0",
+     "class": "StaticMeshComponent",
+     "kind": "mesh",
+     "materials": [
+      {
+       "slot": 0,
+       "scalars": [
+        "Glow"
+       ],
+       "vectors": [
+        "Color"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "Orb_4": {
+   "class": "StaticMeshActor",
+   "location": [
+    -351.1,
+    -145.4,
+    900.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "StaticMeshComponent0",
+     "class": "StaticMeshComponent",
+     "kind": "mesh",
+     "materials": [
+      {
+       "slot": 0,
+       "scalars": [
+        "Glow"
+       ],
+       "vectors": [
+        "Color"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "Orb_5": {
+   "class": "StaticMeshActor",
+   "location": [
+    -145.4,
+    -351.1,
+    900.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "StaticMeshComponent0",
+     "class": "StaticMeshComponent",
+     "kind": "mesh",
+     "materials": [
+      {
+       "slot": 0,
+       "scalars": [
+        "Glow"
+       ],
+       "vectors": [
+        "Color"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "Orb_6": {
+   "class": "StaticMeshActor",
+   "location": [
+    145.4,
+    -351.1,
+    900.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "StaticMeshComponent0",
+     "class": "StaticMeshComponent",
+     "kind": "mesh",
+     "materials": [
+      {
+       "slot": 0,
+       "scalars": [
+        "Glow"
+       ],
+       "vectors": [
+        "Color"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "Orb_7": {
+   "class": "StaticMeshActor",
+   "location": [
+    351.1,
+    -145.4,
+    900.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "StaticMeshComponent0",
+     "class": "StaticMeshComponent",
+     "kind": "mesh",
+     "materials": [
+      {
+       "slot": 0,
+       "scalars": [
+        "Glow"
+       ],
+       "vectors": [
+        "Color"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  "Floor": {
+   "class": "StaticMeshActor",
+   "location": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "components": [
+    {
+     "name": "StaticMeshComponent0",
+     "class": "StaticMeshComponent",
+     "kind": "mesh",
+     "materials": [
+      {
+       "slot": 0,
+       "scalars": [],
+       "vectors": [
+        "BaseColor"
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "mpcs": {
+  "/Game/Beatrig/MPC_Demo": {
+   "scalars": [
+    "Glow"
+   ],
+   "vectors": [
+    "Tint"
+   ]
+  }
+ },
+ "sequences": [
+  "/Game/Beatrig/LS_Demo"
+ ],
+ "camera": {
+  "actor": "Dome_Cam",
+  "class": "OWL360CamCaptureActor",
+  "location": [
+   0.0,
+   0.0,
+   150.0
+  ],
+  "rotation": [
+   -15.0,
+   0.0,
+   0.0
+  ],
+  "projection": "domemaster",
+  "dome_angle": 180.0
+ }
+}

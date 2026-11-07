@@ -7,7 +7,8 @@ SHAPES = ["binary", "punch", "gloss", "razor", "rush", "adsr", "saw_down", "cust
 
 
 class Signal:
-    """v: float32 [C, N]. kind: "value" | "trigger". hits: bool [C, N], frames that must survive key simplification.
+    """v: float32 [C, N] (or [C, N, 4] linear RGBA for kind "color"). kind: "value" | "trigger" | "color".
+    hits: bool [C, N], frames that must survive key simplification.
     aux (triggers only, optional): "len" float32 [C, N] per-hit length in beats (NaN = op default),
     "shape" int16 [C, N] per-hit index into SHAPES (-1 = op default)."""
     __slots__ = ("v", "kind", "hits", "aux")
@@ -16,11 +17,14 @@ class Signal:
         v = np.asarray(v, dtype=np.float32)
         if v.ndim == 1:
             v = v[None, :]
+        if kind == "color" and v.ndim == 2:
+            v = v[None, :, :]
         self.v = v
         self.kind = kind
+        shape = v.shape[:2]
         if hits is None:
-            hits = (v != 0) if kind == "trigger" else np.zeros(v.shape, bool)
-        self.hits = np.asarray(hits, bool).reshape(v.shape)
+            hits = (v != 0) if kind == "trigger" else np.zeros(shape, bool)
+        self.hits = np.broadcast_to(np.asarray(hits, bool), shape).copy() if np.ndim(hits) == 0 else np.asarray(hits, bool).reshape(shape)
         self.aux = aux or {}
 
     @property
@@ -63,10 +67,13 @@ def delay(sig, d):
     must be >= 0. Values: linear interpolation between the two past frames (causal: both are at or before f).
     Triggers: each hit moves to the first frame at or after hit + d, so a delayed hit is never early. The hit mask
     moves the same way."""
-    C, N = sig.v.shape
+    C, N = sig.v.shape[:2]
     d = frame_delays(np.broadcast_to(np.asarray(d, np.float64), (C, N)))
     if np.any(d < 0):
         raise ValueError("negative delay: visuals may not lead the audio")
+    if sig.kind == "color":                                    # each RGBA component like a value signal
+        parts = [delay(Signal(sig.v[..., k], "value", sig.hits), d) for k in range(sig.v.shape[2])]
+        return Signal(np.stack([p.v for p in parts], axis=-1), "color", parts[0].hits)
     if sig.kind == "trigger":
         v = np.zeros_like(sig.v)
         aux = {k: np.full_like(a, np.nan if k == "len" else -1) for k, a in sig.aux.items()}

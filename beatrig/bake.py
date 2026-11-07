@@ -1,4 +1,5 @@
 """Evaluate a rig and bake it: per-frame values per target channel plus RDP-simplified linear keys (bake.json)."""
+import gc
 import json
 import logging
 import math
@@ -10,36 +11,41 @@ import numpy as np
 
 from .analysis import Analysis, open_analysis
 from .check import check, order_nodes
-from .notes import load_notes, normalise
+from .notes import load_notes, normalise, section_frames
 from .ops import Ctx, OpError, SPECS, input_ids
 from .rig import Rig, RigError, sha256
 from .signal import Signal
 from .tempo import Tempo
+from . import safety as safety_mod
 
 log = logging.getLogger("beatrig")
 BAKE_VERSION = 1
 
 
 # ---------- setup
-def analysis_reqs(rig: Rig) -> list:
-    """every band/loudness power series the rig needs, so one audio pass computes them all"""
+def analysis_reqs(rig: Rig, stem=None) -> list:
+    """every band/loudness power series the rig needs from the mix (stem None) or from one stem, so one audio pass
+    computes them all"""
     reqs = []
     for n in rig.nodes:
-        if n.get("op") == "band":
+        src_stem = n.get("stem")
+        if n.get("op") == "band" and src_stem == stem:
             reqs.append(("band", n.get("lo"), n.get("hi"), n.get("weights")))
-        elif n.get("op") == "loudness":
+        elif n.get("op") == "loudness" and src_stem == stem:
             reqs.append(("loud", None, None, n.get("weights")))
         elif n.get("op") == "onsets" and n.get("in") is not None:
             ref = n["in"]
             src = ref if isinstance(ref, dict) else rig.node(ref) or {}
-            if src.get("lo") is not None or src.get("hi") is not None:
+            if (src_stem or src.get("stem")) == stem and (src.get("lo") is not None or src.get("hi") is not None):
                 reqs.append(("band", src.get("lo"), src.get("hi"), src.get("weights")))
     return reqs
 
 
 def analyze(rig: Rig, use_cache: bool = True) -> Optional[Analysis]:
     """Build or load the analysis cache (analysis.json/.npz next to the rig) and compute every band the rig uses.
-    Returns None for a rig without audio. The cache is invalidated by the audio's size/mtime or the analysis settings."""
+    Returns None for a rig without audio. The cache is invalidated by the audio's size/mtime or the analysis settings.
+    Nodes that read a stem ("stem": "drums") also get that stem's analysis (cached in the stem folder) as
+    analysis.stems[name]; the stems must have been separated first (beatrig stems <rig>)."""
     if not rig.audio_path:
         return None
     if not os.path.exists(rig.audio_path):
@@ -48,15 +54,41 @@ def analyze(rig: Rig, use_cache: bool = True) -> Optional[Analysis]:
     a = open_analysis(rig.audio_path, rig.base_dir, rig.data.get("analysis"), rig.data.get("channel_weights"), use_cache)
     a.ensure(analysis_reqs(rig))
     a.save()
+    a.stems = open_stems(rig, use_cache)
     return a
 
 
+def open_stems(rig: Rig, use_cache: bool = True) -> dict:
+    """{stem: Analysis} for the stems the rig's nodes read"""
+    from . import stems as S
+    names = S.used_stems(rig.nodes)
+    if not names:
+        return {}
+    paths = S.cached(rig.audio_path)
+    if paths is None:
+        raise RigError(f"nodes read stems {names} but they are not separated yet: run 'beatrig stems {rig.path or '<rig>'}'")
+    out = {}
+    for name in names:
+        if name not in paths:
+            raise RigError(f"unknown stem {name!r} (one of {S.STEMS})")
+        sa = open_analysis(paths[name], os.path.dirname(paths[name]), rig.data.get("analysis"), None, use_cache)
+        sa.ensure(analysis_reqs(rig, name))
+        sa.save()
+        out[name] = sa
+    return out
+
+
 def frame_count(rig: Rig, analysis: Optional[Analysis]) -> int:
+    """frames = rig.frames, else the audio window (audio_in_s .. audio_out_s or the end of the file) plus the offset"""
     if rig.data.get("frames") is not None:
         return int(rig.data["frames"])
     if analysis is None:
         raise RigError("rig has no audio: set frames")
-    return int(math.ceil(round(analysis.duration * rig.fps, 6))) + rig.offset
+    end = analysis.duration if rig.audio_out_s is None else min(rig.audio_out_s, analysis.duration)
+    span = end - rig.audio_in_s
+    if span <= 0:
+        raise RigError(f"audio window {rig.audio_in_s}..{end} s is empty (the file is {analysis.duration:.3f} s)")
+    return int(math.ceil(round(span * rig.fps, 6))) + rig.offset
 
 
 def resolve_tempo(rig: Rig, analysis: Optional[Analysis], notes: Optional[dict]) -> Tempo:
@@ -65,7 +97,7 @@ def resolve_tempo(rig: Rig, analysis: Optional[Analysis], notes: Optional[dict])
     t = rig.data.get("tempo") or {}
     notes_map = (notes or {}).get("bpm_map") or []
     if t.get("map"):
-        segs = [((m["frame"] - rig.offset) / rig.fps, m["bpm"]) for m in t["map"]]
+        segs = [((m["frame"] - rig.offset) / rig.fps + rig.audio_in_s, m["bpm"]) for m in t["map"]]
     elif t.get("bpm"):
         segs = [(0.0, t["bpm"])]
     elif notes_map:
@@ -86,9 +118,11 @@ def resolve_tempo(rig: Rig, analysis: Optional[Analysis], notes: Optional[dict])
 
 
 def make_ctx(rig, analysis, notes):
+    sset, _ = safety_mod.settings(rig.data)
     ctx = Ctx(rig.fps, frame_count(rig, analysis), rig.offset, resolve_tempo(rig, analysis, notes), analysis, notes, rig.seed,
-              rig.data.get("channel_weights"))
-    ctx.rig_nodes = rig.nodes
+              rig.data.get("channel_weights"), t0=rig.audio_in_s, scene=rig.load_scene(), safety=sset,
+              stems=getattr(analysis, "stems", None) or {})
+    ctx.rig_nodes = rig.resolved_nodes()
     return ctx
 
 
@@ -98,7 +132,7 @@ def evaluate(rig: Rig, analysis: Optional[Analysis] = None, notes: Optional[dict
         notes = load_notes(rig.notes_path)
     ctx = ctx or make_ctx(rig, analysis, notes)
     out = {}
-    for n in order_nodes(rig.nodes):
+    for n in order_nodes(rig.resolved_nodes()):
         spec = SPECS.get(n.get("op"))
         if spec is None:
             raise OpError(n.get("id"), f"unknown op {n.get('op')!r}")
@@ -127,6 +161,19 @@ def ease(name, x):
     return x * x * (3 - 2 * x)                               # in_out: zero velocity at both ends
 
 
+def resolve_layer_keys(keys: list, sections: dict) -> list:
+    """layer keys that name a section ({"section": "breakdown", ...}) -> frame keys (the fade starts at the first
+    frame at or after the section's time). sections: {name: frame} from notes.section_frames."""
+    out = []
+    for k in keys or []:
+        if k.get("section") is not None and k.get("frame") is None:
+            if k["section"] not in sections:
+                raise RigError(f"layer key names section {k['section']!r}, which is not in notes.json sections")
+            k = dict(k, frame=sections[k["section"]])
+        out.append(k)
+    return out
+
+
 def layer_curve(keys: list, frames: int) -> np.ndarray:
     """intensity per frame. A key {frame, value, ease, fade_frames} starts its fade AT `frame` and reaches `value` at
     frame + fade_frames (0 = a cut). Before the first key the first value holds."""
@@ -137,11 +184,15 @@ def layer_curve(keys: list, frames: int) -> np.ndarray:
     f = np.arange(frames, dtype=np.float64)
     cur = float(keys[0]["value"])
     v[:] = cur
-    for k in keys[1:]:
+    rest = keys[1:]
+    starts = [int(np.searchsorted(f, float(k["frame"]), side="left")) for k in rest] + [frames]
+    for j, k in enumerate(rest):                             # a key rules from its frame until the next key's frame
         f0, fade, tgt = float(k["frame"]), float(k.get("fade_frames") or 0), float(k["value"])
-        x = (f - f0) / fade if fade > 0 else (f >= f0).astype(np.float64)
-        seg = cur + (tgt - cur) * ease(k.get("ease", "in_out"), x)
-        v = np.where(f >= f0, seg, v)
+        s0, s1 = starts[j], starts[j + 1]
+        if s1 > s0:
+            fs = f[s0:s1]
+            x = (fs - f0) / fade if fade > 0 else (fs >= f0).astype(np.float64)
+            v[s0:s1] = cur + (tgt - cur) * ease(k.get("ease", "in_out"), x)
         cur = tgt
     return v
 
@@ -149,7 +200,11 @@ def layer_curve(keys: list, frames: int) -> np.ndarray:
 # ---------- keys
 def rdp(v: np.ndarray, tol: float, forced=None) -> np.ndarray:
     """indices of linear keys whose reconstruction (linear interpolation) stays within tol of v everywhere. The first
-    and last frames and every forced frame are kept; RDP runs between consecutive kept frames (vertical error)."""
+    and last frames and every forced frame are kept; RDP runs between consecutive kept frames (vertical error).
+    v may be [N] or [N, K] (a colour channel): the error is then the largest component error.
+    Every open span is split in the same numpy pass (level by level), so the cost is a few array operations per level
+    instead of one Python iteration per key. A span's split point depends only on that span (the largest error, the
+    first one on ties), so this keeps exactly the frames a one-span-at-a-time RDP keeps."""
     n = len(v)
     keep = np.zeros(n, bool)
     if n == 0:
@@ -158,20 +213,37 @@ def rdp(v: np.ndarray, tol: float, forced=None) -> np.ndarray:
     if forced is not None:
         keep[np.asarray(forced, np.int64)] = True
     v = np.asarray(v, np.float64)
+    cols = [v] if v.ndim == 1 else [np.ascontiguousarray(v[:, k]) for k in range(v.shape[1])]
     idx = np.flatnonzero(keep)
-    stack = list(zip(idx[:-1].tolist(), idx[1:].tolist()))
-    while stack:
-        a, b = stack.pop()
-        if b - a < 2:
-            continue
-        t = np.arange(1, b - a, dtype=np.float64) / (b - a)
-        err = np.abs(v[a + 1:b] - (v[a] + (v[b] - v[a]) * t))
-        k = int(np.argmax(err))
-        if err[k] > tol:
-            m = a + 1 + k
-            keep[m] = True
-            stack.append((a, m))
-            stack.append((m, b))
+    a, b = idx[:-1], idx[1:]
+    open_ = b - a >= 2
+    a, b = a[open_], b[open_]
+    while len(a):
+        span = b - a                                         # n per span
+        inner = span - 1                                     # interior frames per span
+        first = np.cumsum(inner) - inner                     # where each span's interior starts in the flat arrays
+        seg = np.repeat(np.arange(len(a)), inner)            # span of each interior frame
+        i = np.arange(len(seg)) - first[seg] + 1             # 1 .. n-1 inside each span
+        t = i / span[seg]                                    # float64 i / n, as np.arange(1, n) / n
+        j = a[seg] + i
+        err = None
+        for col in cols:                                     # colour: the largest component error, one column at a time
+            va = col[a]
+            e = np.abs(col[j] - (va[seg] + (col[b] - va)[seg] * t))
+            err = e if err is None else np.maximum(err, e)
+        top = np.maximum.reduceat(err, first)
+        split = top > tol
+        if not split.any():
+            break
+        at = np.flatnonzero((err == top[seg]) & split[seg])  # the largest error(s) of each span that splits
+        s_at = seg[at]
+        at = at[np.concatenate(([True], s_at[1:] != s_at[:-1]))]   # the first one per span, in span order
+        m = a[seg[at]] + i[at]
+        keep[m] = True
+        a2 = np.concatenate((a[split], m))
+        b2 = np.concatenate((m, b[split]))
+        open_ = b2 - a2 >= 2
+        a, b = a2[open_], b2[open_]
     return np.flatnonzero(keep)
 
 
@@ -182,9 +254,11 @@ def target_channels(target):
 
 
 def bake(rig: Rig, analysis: Optional[Analysis] = None, notes: Optional[dict] = None, out: Optional[str] = None,
-         signals: Optional[dict] = None) -> dict:
+         signals: Optional[dict] = None, strict: bool = True) -> dict:
     """Validate, evaluate and bake. Returns the bake.json structure; writes it to `out` if given. Raises RigError with
-    every check error if the rig is invalid. Same inputs -> byte-identical file."""
+    every check error if the rig is invalid. Same inputs -> byte-identical file.
+    Flash safety runs on the baked values: with a rig "safety" block a violation is an error (RigError unless
+    strict=False); without one it is reported in result["safety"] only."""
     if notes is None:
         notes = load_notes(rig.notes_path)
     errors = [i for i in check(rig, notes) if i["level"] == "error"]
@@ -195,36 +269,87 @@ def bake(rig: Rig, analysis: Optional[Analysis] = None, notes: Optional[dict] = 
     t0 = time.perf_counter()
     ctx = make_ctx(rig, analysis, notes)
     sigs = signals if signals is not None else evaluate(rig, analysis, notes, ctx)
-    layers = {L["id"]: layer_curve(L.get("intensity", []), ctx.frames) for L in rig.layers}
+    secs = section_frames(notes, rig.fps, rig.offset, rig.audio_in_s)
+    layers = {L["id"]: layer_curve(resolve_layer_keys(L.get("intensity", []), secs), ctx.frames) for L in rig.layers}
     bk = rig.data.get("bake") or {}
     tol_rel, dec = float(bk.get("key_tolerance", 0.002)), int(bk.get("decimals", 4))
-    outs = []
+    hashes = {"rig_hash": rig.hash, "notes_hash": sha256(normalise(notes))}
+    gc_on = gc.isenabled()
+    gc.disable()        # millions of small value/key lists: the cyclic GC would re-scan them over and over (they hold no cycles)
+    try:
+        outs, arrays = _bake_outputs(rig, sigs, layers, ctx, tol_rel, dec)
+        result = {"version": BAKE_VERSION, "fps": rig.data.get("fps", 30), "frames": ctx.frames, "audio": rig.data.get("audio"),
+                  "audio_offset_frames": rig.offset}
+        if rig.data.get("audio_in_s") is not None or rig.data.get("audio_out_s") is not None:
+            result["audio_in_s"] = rig.audio_in_s
+            result["audio_out_s"] = rig.audio_out_s
+        result.update(hashes)
+        result["outputs"] = outs
+        issues, summary = safety_mod.check_bake(rig.data, result, arrays)
+        result["safety"] = summary
+        errs = [i for i in issues if i["level"] == "error"]
+        if errs and strict:
+            raise RigError("; ".join(f"{e['where']}: {e['msg']}" for e in errs))
+        log.info("baked %d outputs, %d frames in %.2f s", len(outs), ctx.frames, time.perf_counter() - t0)
+        if out:
+            write_bake(out, result)
+        return result
+    finally:
+        if gc_on:
+            gc.enable()
+
+
+def _bake_outputs(rig, sigs, layers, ctx, tol_rel, dec):
+    """(bake.json outputs, {output id: per-channel value arrays}) for every rig output"""
+    outs, arrays = [], {}
     for o in rig.outputs:
         s = sigs[o["signal"]]
-        lo, hi = float(o.get("min", 0.0)), float(o.get("max", 1.0))
+        target = rig.resolved_target(o["target"])
         inten = layers[o["layer"]] if o.get("layer") else np.ones(ctx.frames)
-        names = target_channels(o["target"])
+        names = target_channels(target)
         s = s.broadcast(len(names))
+        entry = {"id": o["id"]}
+        if o.get("layer"):
+            entry["layer"] = o["layer"]
+        if s.kind == "color":
+            chans, arrays[o["id"]] = color_channels(s, names, inten, tol_rel, dec, with_arrays=True)
+            entry.update({"signal": o["signal"], "value_type": "color", "target": dict(target, value_type="color"),
+                          "channels": chans})
+            outs.append(entry)
+            continue
+        lo, hi = float(o.get("min", 0.0)), float(o.get("max", 1.0))
         tol = tol_rel * abs(hi - lo) if hi != lo else tol_rel
-        chans = []
+        chans, arrays[o["id"]] = [], []
         for c, name in enumerate(names):
             vals = np.round(lo + (s.v[c].astype(np.float64) * inten) * (hi - lo), dec)
             keys = rdp(vals, tol, np.flatnonzero(s.hits[c]))
             ch = {} if name is None else {"actor": name}
             ch["values"] = vals.tolist()
-            ch["keys"] = [[int(k), float(vals[k])] for k in keys]
+            ch["keys"] = [[f, x] for f, x in zip(keys.tolist(), vals[keys].tolist())]
             chans.append(ch)
-        entry = {"id": o["id"]}
-        if o.get("layer"):
-            entry["layer"] = o["layer"]
-        entry.update({"signal": o["signal"], "target": o["target"], "min": lo, "max": hi, "channels": chans})
+            arrays[o["id"]].append(vals)
+        entry.update({"signal": o["signal"], "target": target, "min": lo, "max": hi, "channels": chans})
         outs.append(entry)
-    result = {"version": BAKE_VERSION, "fps": rig.data.get("fps", 30), "frames": ctx.frames, "audio": rig.data.get("audio"),
-              "audio_offset_frames": rig.offset, "rig_hash": rig.hash, "notes_hash": sha256(normalise(notes)), "outputs": outs}
-    log.info("baked %d outputs, %d frames in %.2f s", len(outs), ctx.frames, time.perf_counter() - t0)
-    if out:
-        write_bake(out, result)
-    return result
+    return outs, arrays
+
+
+def color_channels(s: Signal, names: list, inten: np.ndarray, tol_rel: float, dec: int, with_arrays: bool = False):
+    """colour output channels: values [[r, g, b, a], ...] (RGB scaled by the layer intensity, alpha kept) and keys
+    [[frame, r, g, b, a], ...] from a 4-vector RDP whose tolerance is key_tolerance x the channel's largest component
+    range. with_arrays: also return the per-channel [N, 4] value arrays."""
+    chans, arrs = [], []
+    for c, name in enumerate(names):
+        v = s.v[c].astype(np.float64).copy()
+        v[:, :3] *= inten[:, None]
+        vals = np.round(v, dec)
+        rng = float((vals.max(axis=0) - vals.min(axis=0)).max()) if len(vals) else 0.0
+        keys = rdp(vals, tol_rel * rng if rng > 0 else tol_rel, np.flatnonzero(s.hits[c]))
+        ch = {} if name is None else {"actor": name}
+        ch["values"] = vals.tolist()
+        ch["keys"] = [[f] + row for f, row in zip(keys.tolist(), vals[keys].tolist())]
+        chans.append(ch)
+        arrs.append(vals)
+    return (chans, arrs) if with_arrays else chans
 
 
 def write_bake(path: str, result: dict) -> None:
@@ -234,16 +359,16 @@ def write_bake(path: str, result: dict) -> None:
         fh.write("\n")
 
 
-def bake_from_objects(rig_dict: dict, notes_dict: Optional[dict], base_dir: str) -> dict:
+def bake_from_objects(rig_dict: dict, notes_dict: Optional[dict], base_dir: str, strict: bool = True) -> dict:
     """Bake an unsaved rig + notes held in memory (preview server / MCP). Relative paths in rig_dict resolve from
     base_dir; the analysis cache there is reused. notes_dict None = read the rig's notes file. Nothing is written."""
     rig = Rig.from_dict(rig_dict, base_dir)
     notes = load_notes(rig.notes_path) if notes_dict is None else notes_dict
-    return bake(rig, None, notes)
+    return bake(rig, None, notes, strict=strict)
 
 
 def bake_stats(result: dict) -> list:
-    """[(output id, channels, min, max, mean, total keys, frames)] for printing"""
+    """[(output id, channels, min, max, mean, total keys, frames)] for printing (colour: over all components)"""
     rows = []
     for o in result["outputs"]:
         v = np.array([c["values"] for c in o["channels"]], np.float64)

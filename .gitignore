@@ -27,3 +27,4 @@ TASKS.md
 web/dev/loop.wav
 web/dev/analysis.*
 web/dev/bake.json
+*.stems/
