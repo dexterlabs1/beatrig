@@ -185,13 +185,14 @@ class Series {
   constructor(hdr, buf, off) {
     this.id = hdr.id; this.hash = hdr.hash; this.bakeId = hdr.bake_id;
     this.C = hdr.channels; this.N = hdr.frames; this.comps = hdr.components;
+    this.S0 = hdr.start_frame || 0;          // series index i = sequence frame S0 + i (bake.start_frame, v0.3)
     this.d = new Float32Array(buf, off, this.C * this.N * this.comps);
     this.pyr = new Array(this.C);
     this.max = null;
   }
-  at(c, f) { f = f < 0 ? 0 : f >= this.N ? this.N - 1 : f | 0; return this.d[c * this.N + f]; }
+  at(c, f) { f -= this.S0; f = f < 0 ? 0 : f >= this.N ? this.N - 1 : f | 0; return this.d[c * this.N + f]; }
   rgba(c, f, out) {
-    f = f < 0 ? 0 : f >= this.N ? this.N - 1 : f | 0;
+    f -= this.S0; f = f < 0 ? 0 : f >= this.N ? this.N - 1 : f | 0;
     const i = (c * this.N + f) * 4, d = this.d;
     out[0] = d[i]; out[1] = d[i + 1]; out[2] = d[i + 2]; out[3] = d[i + 3];
     return out;
@@ -243,7 +244,7 @@ class Series {
   // min and max per pixel column over [0, w); NaN where the column has no frames
   cols(c, w, mn, mx) {
     const N = this.N, d = this.d, base = c * N;
-    const fpp = S.fps / S.view.pps, f0 = fxOf(0), L = this.level(c, fpp);
+    const fpp = S.fps / S.view.pps, f0 = fxOf(0) - this.S0, L = this.level(c, fpp);
     for (let x = 0; x < w; x++) {
       // each column covers the frames whose start falls inside it (at least one, so zoomed in it repeats a frame)
       const fa = Math.floor(f0 + x * fpp);
@@ -259,7 +260,7 @@ class Series {
   // mean colour per pixel column (RGB triplets); NaN where the column has no frames
   colsRGB(c, w, out) {
     const N = this.N, d = this.d;
-    const fpp = S.fps / S.view.pps, f0 = fxOf(0), L = this.level(c, fpp);
+    const fpp = S.fps / S.view.pps, f0 = fxOf(0) - this.S0, L = this.level(c, fpp);
     for (let x = 0; x < w; x++) {
       const fa = Math.floor(f0 + x * fpp);
       let fb = Math.floor(f0 + (x + 1) * fpp); if (fb <= fa) fb = fa + 1;
@@ -493,12 +494,13 @@ function drawValues(ctx, s, c, w, top, height, lo, hi, color, fill) {
   const fpp = S.fps / S.view.pps;
   ctx.beginPath();
   if (fpp <= 2) {
-    const f0 = Math.max(0, Math.floor(fxOf(0)) - 1), f1 = Math.min(s.N - 1, Math.ceil(fxOf(w)) + 1);
+    const S0 = s.S0 || 0;                                   // series index -> sequence frame S0 + index
+    const f0 = Math.max(0, Math.floor(fxOf(0) - S0) - 1), f1 = Math.min(s.N - 1, Math.ceil(fxOf(w) - S0) + 1);
     if (f1 < f0) return;
     const off = c * s.N, d = s.d;
-    if (fill) ctx.moveTo(xOfFrame(f0), base);
-    for (let f = f0; f <= f1; f++) { const x = xOfFrame(f), y = yOf(d[off + f]); if (f === f0 && !fill) ctx.moveTo(x, y); else ctx.lineTo(x, y); }
-    if (fill) { ctx.lineTo(xOfFrame(f1), base); ctx.closePath(); ctx.fillStyle = color; ctx.fill(); }
+    if (fill) ctx.moveTo(xOfFrame(f0 + S0), base);
+    for (let f = f0; f <= f1; f++) { const x = xOfFrame(f + S0), y = yOf(d[off + f]); if (f === f0 && !fill) ctx.moveTo(x, y); else ctx.lineTo(x, y); }
+    if (fill) { ctx.lineTo(xOfFrame(f1 + S0), base); ctx.closePath(); ctx.fillStyle = color; ctx.fill(); }
     else { ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.stroke(); }
     return;
   }

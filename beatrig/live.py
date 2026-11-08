@@ -75,25 +75,42 @@ def _load_bake(bake):
 
 
 def _slim_output(o):
-    """what the applier needs from an output: id, target, value_type and per-channel keys (no per-frame values)"""
+    """what the applier needs from an output: id, target, value_type, blend and per-channel keys (no per-frame
+    values)"""
     s = {"id": o["id"], "target": o.get("target") or {},
          "channels": [{"actor": c.get("actor"), "keys": c.get("keys") or []} for c in o.get("channels", [])]}
     if o.get("value_type"):
         s["value_type"] = o["value_type"]
+    if o.get("blend") and o["blend"] != "replace":
+        s["blend"] = o["blend"]
     return s
 
 
 def slim_bake(bake, ids=None):
     """a bake.json dict reduced to what the editor reads (keys only), optionally just the outputs in ids"""
-    return {"version": bake.get("version", 1), "fps": bake.get("fps", 30), "frames": bake.get("frames"),
-            "outputs": [_slim_output(o) for o in bake.get("outputs", []) if ids is None or o.get("id") in ids]}
+    s = {"version": bake.get("version", 1), "fps": bake.get("fps", 30), "frames": bake.get("frames"),
+         "outputs": [_slim_output(o) for o in bake.get("outputs", []) if ids is None or o.get("id") in ids]}
+    if bake.get("key_tolerance") is not None:          # optional: RDP tolerance for multiply/add final keys
+        s["key_tolerance"] = bake["key_tolerance"]
+    if bake.get("start_frame"):                        # key frame f lands on sequence frame start_frame + f
+        s["start_frame"] = bake["start_frame"]
+    return s
 
 
-def output_hash(output, fps, start=0):
-    """content hash of everything the applier writes for one output: target, value type and keys (not the per-frame
-    values, the min/max or the rig hash), plus the bake fps and the start frame"""
+def _start(bake, start):
+    """the sequence frame of the bake's key frame 0: its "start_frame" plus the caller's start"""
+    return int(bake.get("start_frame") or 0) + int(start)
+
+
+def output_hash(output, fps, start=0, tolerance=None):
+    """content hash of everything the applier writes for one output: target, value type, blend and keys (not the
+    per-frame values, the min/max or the rig hash), plus the bake fps, the start frame and, for a multiply/add output,
+    the key tolerance. A blended output's base lives in the sequence, so an edited base is caught by the editor
+    (push asks again for outputs whose base changed), not by this hash."""
     s = _slim_output(output)
     s["fps"], s["start"] = fps, int(start)
+    if s.get("blend") and tolerance is not None:
+        s["tol"] = tolerance
     return hashlib.sha1(json.dumps(s, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:20]
 
 
@@ -273,21 +290,24 @@ class Link:
 
     def apply(self, bake, sequence, only=None, start=0, save=False, refresh=True):
         """write a bake (dict or path) into a Level Sequence; only = output ids. refresh re-evaluates the sequence if
-        it is the one open in Sequencer."""
+        it is the one open in Sequencer. multiply/add outputs are written as an additive offset over the target's own
+        section, which is left untouched (static x gain when it has none; see docs/unreal.md)."""
         b = slim_bake(_load_bake(bake), only)
         fps = b.get("fps", 30)
-        hashes = {o["id"]: output_hash(o, fps, start) for o in b["outputs"]}
+        hashes = {o["id"]: output_hash(o, fps, _start(b, start), b.get("key_tolerance")) for o in b["outputs"]}
         res = self._rpc("apply", {"sequence": sequence, "bake": b, "only": None, "start": int(start),
                                   "save": bool(save), "refresh": bool(refresh), "hashes": hashes})
         self._remember(sequence, start, b, res)
         return res
 
     def check(self, bake, sequence, only=None, start=0):
-        """read the keys back from the sequence and compare them with the bake, key for key"""
+        """read the keys back from the sequence and compare them with the bake, key for key (multiply/add outputs:
+        with the offset recomputed from the target's current base)"""
         return self._rpc("check", {"sequence": sequence, "bake": slim_bake(_load_bake(bake), only), "start": int(start)})
 
     def undo(self, sequence, output_id=None, save=False, refresh=True):
-        """remove beatrig's tracks (all, or one output's) and the now-empty bindings beatrig created"""
+        """remove beatrig's tracks (all, or one output's) and the now-empty bindings beatrig created (base sections
+        under multiply/add outputs were never changed)"""
         res = self._rpc("undo", {"sequence": sequence, "output_id": output_id, "save": bool(save),
                                  "refresh": bool(refresh)})
         self.forget(sequence, output_id)
@@ -297,12 +317,14 @@ class Link:
         """Write the bake's outputs into the sequence, skipping outputs whose content hash matches the last push of
         this Link to this sequence. Outputs pushed earlier but gone from the bake are removed. One editor call (two if
         the editor reports an output it no longer holds as pushed, e.g. after an undo elsewhere). focus=True opens
-        the sequence in Sequencer first. Returns {"ok", "pushed", "skipped", "removed", "errors", "keys", "ms",
-        "rt_ms", "editor_ms", "write_ms", "calls", "refreshed"} (pushed/skipped/removed are output ids)."""
+        the sequence in Sequencer first. A multiply/add output whose base section was edited in the editor since it
+        was applied counts as changed (the editor reports it, the second call rewrites it from the new base).
+        Returns {"ok", "pushed", "skipped", "removed", "base_edited", "errors", "keys", "ms", "rt_ms", "editor_ms",
+        "write_ms", "calls", "refreshed"} (pushed/skipped/removed/base_edited are output ids)."""
         t0 = time.perf_counter()
         b = _load_bake(bake)
-        fps = b.get("fps", 30)
-        cur = {o["id"]: [output_hash(o, fps, start), track_count(o)] for o in b.get("outputs", [])}
+        fps, tol = b.get("fps", 30), b.get("key_tolerance")
+        cur = {o["id"]: [output_hash(o, fps, _start(b, start), tol), track_count(o)] for o in b.get("outputs", [])}
         with self._lock:
             cache = self._pushed.setdefault((sequence, int(start)), {})
             changed = [i for i in cur if not only_changed or cache.get(i) != cur[i]]
@@ -331,7 +353,7 @@ class Link:
                 cache.pop(i, None)
         pushed = [i for i in cur if i in changed and i not in failed]
         return {"ok": bool(res.get("ok", False)), "pushed": pushed, "skipped": [i for i in cur if i not in changed],
-                "removed": gone, "errors": res.get("errors", []), "keys": res.get("keys", 0),
+                "removed": gone, "base_edited": res.get("base_edited", []), "errors": res.get("errors", []), "keys": res.get("keys", 0),
                 "ms": round((time.perf_counter() - t0) * 1000, 2), "rt_ms": round(rt, 2), "editor_ms": round(ed, 2),
                 "write_ms": res.get("write_ms"), "refresh_ms": res.get("refresh_ms"), "calls": calls,
                 "refreshed": bool(res.get("refreshed")), "bindings": res.get("bindings")}
@@ -350,7 +372,8 @@ class Link:
             if o["id"] in failed:
                 cache.pop(o["id"], None)
             else:
-                cache[o["id"]] = [output_hash(o, fps, start), track_count(o)]
+                cache[o["id"]] = [output_hash(o, fps, _start(bake, start), bake.get("key_tolerance")),
+                                  track_count(o)]
 
     def forget(self, sequence=None, output_id=None):
         """drop the push cache (all, one sequence, or one output in it): the next push rewrites those outputs"""

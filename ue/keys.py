@@ -13,9 +13,17 @@ Two time bases, and the reason this file exists:
 
 Colour keys ([frame, r, g, b, a], linear RGBA) become four channels per track. Their names differ by track type, and
 channel_names() says which to read back.
+
+Output blend (v0.3): a "multiply" or "add" output carries gains or offsets. Over a base section (the show's own keys,
+left active and untouched) the applier writes an ADDITIVE section: offset_frame_keys() gives base x (gain - 1) or the
+offset, from the base evaluated at every frame. With no base it writes an ABSOLUTE section of static x gain
+(blend_frame_keys()). Both use the engine's relative-tolerance RDP (rdp() here is a pure-Python twin of
+beatrig.bake.rdp).
 """
 import hashlib
+import json
 import os
+import re
 from fractions import Fraction
 
 TAG_PREFIX = "beatrig:"
@@ -203,7 +211,9 @@ def plan_output(output, bake_fps, display_rate, tick_resolution, start_frame=0):
     """One bake output -> a list of track writes. Each item:
         {"tag", "output", "kind", "value_type" (float|color), "track", "time_base", "actor" | None, "asset" | None,
          "param" | None, "property" | None, "channel_index" | None, "channel_name" | None, "blend" (absolute|additive),
-         "material_index", "range": [first, last+1] display frames, "keys": [(time, value | (r, g, b, a)), ...]}
+         "output_blend" (replace|multiply|add), "material_index", "range": [first, last+1] display frames,
+         "keys": [(time, value | (r, g, b, a)), ...], and for multiply/add "src_keys": the gains/offsets in display
+         frames (the applier reads the base and replaces "keys", "range" and "blend", see blended_plan)}
     Raises PlanError for anything that can't be written."""
     err = check_rate(bake_fps, display_rate)
     if err:
@@ -233,6 +243,10 @@ def plan_output(output, bake_fps, display_rate, tick_resolution, start_frame=0):
     if kind in ("mpc", "material", "niagara") and not t.get("param"):
         raise PlanError(f"{oid}: {kind} target needs a param")
     param = niagara_param(t["param"]) if kind == "niagara" else t.get("param")
+    mode = output_blend(output)
+    if mode != "replace" and kind == "transform":
+        raise PlanError(f"{oid}: blend {mode!r} is not for transforms; they already layer on the actor's own animation, "
+                        f"use target.additive for transforms")
     width = 5 if vt == "color" else 2
     plans = []
     for ch in output.get("channels", []):
@@ -246,26 +260,41 @@ def plan_output(output, bake_fps, display_rate, tick_resolution, start_frame=0):
         if bad is not None:
             raise PlanError(f"{oid}: {vt} keys are [frame{', r, g, b, a' if width == 5 else ', value'}], got {bad!r}")
         first, last = int(keys[0][0]) + int(start_frame), int(keys[-1][0]) + int(start_frame)
-        plans.append({
+        p = {
             "tag": tag(oid, actor), "output": oid, "kind": kind, "value_type": vt, "track": track, "time_base": base,
             "actor": actor, "asset": t.get("asset"), "param": param, "property": prop,
-            "channel_index": chan_idx, "channel_name": chan_name, "blend": blend,
+            "channel_index": chan_idx, "channel_name": chan_name, "blend": blend, "output_blend": mode,
             "material_index": int(t.get("material_index", 0)),
             "range": [first, last + 1],
             "keys": to_time_base(keys, base, start_frame, tick_resolution, display_rate),
-        })
+        }
+        if mode != "replace":
+            # gains / offsets in display frames; the applier turns them into final keys once it has read the base
+            p["src_keys"] = to_time_base(keys, "frames", start_frame)
+        plans.append(p)
     return plans
 
 
+def bake_start(bake, start_frame=0):
+    """the sequence frame of the bake's key frame 0: the bake's own "start_frame" (a bake whose values start at that
+    sequence frame; default 0) plus the applier's start_frame (--start), which shifts it further"""
+    try:
+        return int(bake.get("start_frame") or 0) + int(start_frame)
+    except (TypeError, ValueError):
+        raise PlanError(f"bake start_frame must be a whole frame, got {bake.get('start_frame')!r}") from None
+
+
 def plan_bake(bake, display_rate, tick_resolution, start_frame=0, only=None):
-    """every output in a bake.json dict (or just the ids in `only`) -> track writes"""
+    """every output in a bake.json dict (or just the ids in `only`) -> track writes. A key at frame f lands on sequence
+    frame bake["start_frame"] + start_frame + f."""
     if int(bake.get("version", 0)) != 1:
         raise PlanError(f"unsupported bake version {bake.get('version')!r}")
+    start = bake_start(bake, start_frame)
     out = []
     for o in bake.get("outputs", []):
         if only and o.get("id") not in only:
             continue
-        out.extend(plan_output(o, bake.get("fps", 30), display_rate, tick_resolution, start_frame))
+        out.extend(plan_output(o, bake.get("fps", 30), display_rate, tick_resolution, start))
     return out
 
 
@@ -290,6 +319,266 @@ def merge_reports(reports):
             "actual": sum(r["actual"] for r in reports), "missing": sum(r["missing"] for r in reports),
             "extra": sum(r["extra"] for r in reports),
             "max_value_err": max((r["max_value_err"] for r in reports), default=0.0), "first_bad": bad}
+
+
+# ------------------------------------------------------------------ output blend (v0.3): multiply / add onto a base
+BLENDS = ("replace", "multiply", "add")
+NEUTRAL = {"multiply": 1.0, "add": 0.0}     # the gain / offset that leaves the base unchanged
+DEFAULT_KEY_TOLERANCE = 0.002                # the engine's default bake.key_tolerance (relative)
+
+
+def output_blend(output):
+    """'replace' (default), 'multiply' or 'add' from an output's "blend" """
+    b = str(output.get("blend") or "replace").lower()
+    if b not in BLENDS:
+        raise PlanError(f"{output.get('id')}: blend {b!r} unknown (one of {', '.join(BLENDS)})")
+    return b
+
+
+def rdp(values, tol, forced=()):
+    """Indices of linear keys whose reconstruction stays within tol of values everywhere (vertical error). The first and
+    last indices and every forced index are kept. values may hold floats or equal-length tuples (colour): the error is
+    then the largest component error. Pure Python; keeps exactly the indices beatrig.bake.rdp keeps (a span's split is
+    its largest error, the first one on ties)."""
+    n = len(values)
+    if n == 0:
+        return []
+    keep = [False] * n
+    keep[0] = keep[-1] = True
+    for i in forced:
+        if 0 <= i < n:
+            keep[i] = True
+    vec = isinstance(values[0], (tuple, list))
+    idx = [i for i in range(n) if keep[i]]
+    stack = [(a, b) for a, b in zip(idx, idx[1:]) if b - a >= 2]
+    while stack:
+        a, b = stack.pop()
+        span = b - a
+        va, vb = values[a], values[b]
+        best, at = -1.0, -1
+        if vec:
+            d = [y - x for x, y in zip(va, vb)]
+            for i in range(1, span):
+                t = i / span
+                vj = values[a + i]
+                e = max(abs(vj[k] - (va[k] + d[k] * t)) for k in range(len(va)))
+                if e > best:
+                    best, at = e, a + i
+        else:
+            d = vb - va
+            for i in range(1, span):
+                e = abs(values[a + i] - (va + d * (i / span)))
+                if e > best:
+                    best, at = e, a + i
+        if best > tol:
+            keep[at] = True
+            if at - a >= 2:
+                stack.append((a, at))
+            if b - at >= 2:
+                stack.append((at, b))
+    return [i for i in range(n) if keep[i]]
+
+
+def sample_keys(keys, frames, neutral):
+    """[(frame, value or tuple)] linear keys -> their value at each frame in `frames` (ascending). Frames before the
+    first key or after the last get `neutral` (a gain of 1 / an offset of 0 outside the bake range)."""
+    out = []
+    keys = sorted((float(f), v) for f, v in keys)
+    if not keys:
+        return [neutral for _ in frames]
+    vec = isinstance(keys[0][1], (tuple, list))
+    j, last = 0, len(keys) - 1
+    for f in frames:
+        if f < keys[0][0] - 1e-9 or f > keys[-1][0] + 1e-9:
+            out.append(neutral)
+            continue
+        while j < last and keys[j + 1][0] <= f:
+            j += 1
+        f0, v0 = keys[j]
+        if j == last or abs(f - f0) < 1e-9:
+            out.append(v0)
+            continue
+        f1, v1 = keys[j + 1]
+        t = (f - f0) / (f1 - f0)
+        out.append(tuple(a + (b - a) * t for a, b in zip(v0, v1)) if vec else v0 + (v1 - v0) * t)
+    return out
+
+
+def combine(base, gain, mode):
+    """final = base x gain (multiply) or base + gain (add); tuples combine per component (colour: RGBA)"""
+    if mode not in NEUTRAL:
+        raise PlanError(f"combine: blend {mode!r} is not multiply or add")
+    mul = mode == "multiply"
+    if isinstance(base, (tuple, list)):
+        g = gain if isinstance(gain, (tuple, list)) else (gain,) * len(base)
+        return tuple(b * x if mul else b + x for b, x in zip(base, g))
+    return base * gain if mul else base + gain
+
+
+def value_range(values):
+    """max - min over floats, or the largest per-component range over tuples"""
+    if not values:
+        return 0.0
+    if isinstance(values[0], (tuple, list)):
+        return max(max(v[k] for v in values) - min(v[k] for v in values) for k in range(len(values[0])))
+    return max(values) - min(values)
+
+
+def offset_value(base, gain, mode):
+    """the additive offset that turns base into the blended value: base x (gain - 1) for multiply, the offset itself for
+    add (tuples per component)"""
+    if mode == "add":
+        return gain
+    if mode != "multiply":
+        raise PlanError(f"offset_value: blend {mode!r} is not multiply or add")
+    if isinstance(base, (tuple, list)):
+        g = gain if isinstance(gain, (tuple, list)) else (gain,) * len(base)
+        return tuple(b * (x - 1.0) for b, x in zip(base, g))
+    return base * (gain - 1.0)
+
+
+def offset_frame_keys(src_keys, mode, span_first, base_values, tol_rel=DEFAULT_KEY_TOLERANCE):
+    """The keys of the ADDITIVE section that sits on top of an untouched base, as [(display frame, offset)].
+    src_keys: the output's gain/offset keys [(display frame, value)] (already shifted by the start frame).
+    base_values: the base evaluated at display frames span_first, span_first + 1, ... The span is normally the bake
+    range plus one frame each side (first - 1 .. last + 1): outside the gain keys the gain is neutral, so the offset is
+    exactly 0 there and those two keys bring the section back to nothing (frames outside play the base alone).
+    multiply: offset = base x (gain - 1); add: offset = the offset keys (the base doesn't matter, pass zeros).
+    Simplified with the engine's RDP; the tolerance is tol_rel x the range of the final curve (base + offset), since an
+    error in the offset is the same error in the final value. Every gain key frame is kept (they include the hits)."""
+    n = len(base_values)
+    if n == 0:
+        return []
+    vec = isinstance(base_values[0], (tuple, list))
+    neutral = NEUTRAL[mode]
+    if vec:
+        neutral = (neutral,) * len(base_values[0])
+    frames = range(int(span_first), int(span_first) + n)
+    offs = [offset_value(b, g, mode) for b, g in zip(base_values, sample_keys(src_keys, frames, neutral))]
+    final = [combine(b, o, "add") for b, o in zip(base_values, offs)]
+    rng = value_range(final)
+    tol = tol_rel * rng if rng > 0 else tol_rel
+    forced = sorted({int(round(float(f))) - int(span_first) for f, _ in src_keys})
+    idx = rdp(offs, tol, [i for i in forced if 0 <= i < n])
+    return [(int(span_first) + i, offs[i]) for i in idx]
+
+
+def target_key(plan):
+    """one string per animated target (the same MPC parameter, the same light property of one actor, ...), so two beatrig
+    outputs blending the same target can be told apart from two blending neighbours in one shared section"""
+    return "|".join(str(plan.get(k)) for k in ("kind", "asset", "actor", "param", "property", "material_index",
+                                                "channel_name", "value_type"))
+
+
+def blend_frame_keys(src_keys, mode, span_first, base_values, tol_rel=DEFAULT_KEY_TOLERANCE):
+    """The keys of final = base (x|+) gain, as [(display frame, value or (r, g, b, a))] (the no-base case: written as an
+    ABSOLUTE section over the bake range, with base_values the recorded static value at every frame).
+    src_keys: the output's gain/offset keys [(display frame, value)] (already shifted by the start frame).
+    base_values: the base evaluated at display frames span_first, span_first + 1, ... (one per frame of the span).
+    The gain between its keys is their linear interpolation (what Sequencer would play for the gain curve), neutral
+    outside them. The result is simplified with the engine's relative-tolerance RDP (tolerance x the final values'
+    range); every gain key frame is kept (they include the trigger hits), and so are the frames just outside the gain
+    keys when the span reaches them."""
+    n = len(base_values)
+    if n == 0:
+        return []
+    vec = isinstance(base_values[0], (tuple, list))
+    neutral = NEUTRAL[mode]
+    if vec:
+        neutral = (neutral,) * len(base_values[0])
+    frames = range(int(span_first), int(span_first) + n)
+    gains = sample_keys(src_keys, frames, neutral)
+    final = [combine(b, g, mode) for b, g in zip(base_values, gains)]
+    rng = value_range(final)
+    tol = tol_rel * rng if rng > 0 else tol_rel
+    forced = set()
+    for f, _ in src_keys:
+        i = int(round(float(f))) - int(span_first)
+        forced.add(i)
+    if src_keys:
+        forced.add(int(round(float(src_keys[0][0]))) - int(span_first) - 1)
+        forced.add(int(round(float(src_keys[-1][0]))) - int(span_first) + 1)
+    idx = rdp(final, tol, sorted(i for i in forced if 0 <= i < n))
+    return [(int(span_first) + i, final[i]) for i in idx]
+
+
+def blended_plan(plan, frame_keys, rng, section_blend, tick_resolution=24000, display_rate=30):
+    """a copy of a multiply/add plan ready to write: keys in the plan's time base, section range rng = [start, end)
+    display frames, and the section's blend type ("additive": an offset over a base section; "absolute": final values
+    over a static base)"""
+    if section_blend not in ("additive", "absolute"):
+        raise PlanError(f"section blend {section_blend!r} is not additive or absolute")
+    out = dict(plan)
+    out["keys"] = frames_to_time_base(frame_keys, plan["time_base"], tick_resolution, display_rate)
+    out["range"] = list(rng)
+    out["blend"] = section_blend
+    return out
+
+
+# What a multiply/add track was applied over is recorded in the sequence asset's metadata, one tag per track:
+#   "beatrig.base:<track tag>" -> JSON {"v": 1, "output", "mode", "target": target_key(plan), "kind": "section" | "static",
+#                                       "section": <base section path inside the sequence>, "track": <base track name>,
+#                                       "channels": [...], "fp": <fingerprint of the base keys> (multiply only),
+#                                       "static": value | [r, g, b, a]}
+BASE_META_PREFIX = "beatrig.base:"
+
+
+def base_meta_key(track_tag):
+    return BASE_META_PREFIX + str(track_tag)
+
+
+def base_meta_tag(key):
+    """'beatrig.base:beatrig:glow' -> 'beatrig:glow'; anything else -> None"""
+    key = str(key)
+    return key[len(BASE_META_PREFIX):] if key.startswith(BASE_META_PREFIX) else None
+
+
+def encode_record(rec):
+    return json.dumps(rec, sort_keys=True, separators=(",", ":"))
+
+
+def decode_record(text):
+    try:
+        rec = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def relative_path(obj_path, seq_path):
+    """an object path inside a sequence, relative to it ('MovieScene_0.Track_1.Section_0'), so a renamed or moved
+    sequence still resolves its records; None when obj_path is not inside seq_path"""
+    prefix = str(seq_path) + ":"
+    return obj_path[len(prefix):] if str(obj_path).startswith(prefix) else None
+
+
+def fingerprint(rows):
+    """short stable hash of anything JSON-able (the base channels' keys), to tell when a base was edited"""
+    return hashlib.sha1(json.dumps(rows, separators=(",", ":"), default=str).encode()).hexdigest()[:16]
+
+
+def srgb8_to_linear(c):
+    """an 8-bit sRGB colour (r, g, b, a 0..255; an FColor such as LightColor) -> linear RGBA floats, the way
+    FLinearColor(FColor) converts (sRGB curve on RGB, alpha linear)"""
+    def ch(x):
+        x = x / 255.0
+        return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+    r, g, b, a = (list(c) + [255])[:4]
+    return (ch(r), ch(g), ch(b), a / 255.0)
+
+
+def editor_property_name(name):
+    """an Unreal property name -> its Python editor-property name ('AttenuationRadius' -> 'attenuation_radius')"""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(name)).lower()
+
+
+def frames_to_time_base(frame_keys, base, tick_resolution=24000, display_rate=30):
+    """[(display frame, value)] -> [(time, value)] in 'frames' or 'ticks' (no start shift: the frames already carry it)"""
+    if base == "frames":
+        return [(int(f), v) for f, v in frame_keys]
+    if base == "ticks":
+        return [(frame_to_ticks(int(f), tick_resolution, display_rate), v) for f, v in frame_keys]
+    raise PlanError(f"unknown time base {base!r}")
 
 
 def compare_keys(expected, actual, value_tol=1e-3, frame_tol=0.01):

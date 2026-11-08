@@ -8,7 +8,7 @@ from .signal import SHAPES
 
 TOP_KEYS = {"audio", "fps", "frames", "audio_offset_frames", "tempo", "seed", "nodes", "layers", "outputs", "bake",
             "channel_weights", "notes", "analysis", "name", "description", "comment",
-            "scene", "groups", "safety", "audio_in_s", "audio_out_s"}
+            "scene", "groups", "safety", "audio_in_s", "audio_out_s", "cache_dir"}
 TARGETS = {"light": ("actors",), "material": ("actors", "param"), "niagara": ("actors", "param"), "mpc": ("asset", "param"),
            "transform": ("actors", "property")}
 TRANSFORM_AXES = {"location": ["x", "y", "z"], "rotation": ["roll", "pitch", "yaw"], "scale": ["x", "y", "z"]}
@@ -18,7 +18,8 @@ ENUMS = {("lfo", "shape"): LFO_SHAPES, ("envelope", "shape"): SHAPES, ("math", "
          ("merge", "fn"): ["max", "mean"], ("curve", "preset"): list(CURVE_PRESETS),
          ("shuffle_hits", "mode"): ["bag", "random"], ("spatial_delay", "shape"): ["point", "axis", "plane"],
          ("spatial_delay", "direction"): ["out", "in"], ("dome_wave", "mode"): ["zenith_rings", "azimuth_sweep"],
-         ("flash_limit", "mode"): ["drop", "delay"]}
+         ("flash_limit", "mode"): ["first", "drop", "delay", "strongest"], ("beats", "velocity"): ["strength", "confidence"]}
+BLENDS = ("replace", "multiply", "add")
 TRIGGER_IN = ("envelope", "cycle", "push", "shuffle_hits", "every_n", "probability", "quantize")
 SPATIAL = ("spatial_delay", "dome_wave")
 SAFETY_KEYS = {"max_flashes_per_s", "min_swing", "outputs"}
@@ -78,6 +79,8 @@ def check(rig, notes: Optional[dict] = None, bake: Optional[dict] = None) -> lis
     cw = d.get("channel_weights")
     if cw is not None and (not isinstance(cw, list) or not cw or not all(_num(x) and x >= 0 for x in cw) or not any(cw)):
         err("rig.channel_weights", "must be a list of weights >= 0, one per audio channel (e.g. 5.1: [1, 1, 1, 0.5, 0.7, 0.7])")
+    if d.get("cache_dir") is not None and (not isinstance(d["cache_dir"], str) or not d["cache_dir"].strip()):
+        err("rig.cache_dir", "must be a folder path (relative to the rig) for the analysis cache")
     tempo = d.get("tempo") or {}
     if tempo.get("bpm") is not None and (not _num(tempo["bpm"]) or tempo["bpm"] <= 0):
         err("rig.tempo.bpm", "bpm must be > 0")
@@ -87,6 +90,9 @@ def check(rig, notes: Optional[dict] = None, bake: Optional[dict] = None) -> lis
     tol = (d.get("bake") or {}).get("key_tolerance", 0.002)
     if not _num(tol) or tol < 0:
         err("rig.bake.key_tolerance", "must be >= 0")
+    sf0 = (d.get("bake") or {}).get("start_frame")
+    if sf0 is not None and (not isinstance(sf0, int) or isinstance(sf0, bool) or sf0 < 0):
+        err("rig.bake.start_frame", "must be an integer >= 0 (the first sequence frame baked)")
     sf = d.get("safety")
     if sf is not None:
         if not isinstance(sf, dict):
@@ -345,6 +351,7 @@ def check(rig, notes: Optional[dict] = None, bake: Optional[dict] = None) -> lis
                 err(where, f"transform axis {axis!r} for {prop} not in {TRANSFORM_AXES[prop]}")
             if t.get("additive") is not None and not isinstance(t["additive"], bool):
                 err(where, "additive must be true or false")
+        _check_blend(o, where, kind, sk == "color" or wants_color, err, warn)
         if kind == "mpc":
             if c is not None and c != 1:
                 err(where, f"signal {sig!r} has {c} channels; an MPC param takes 1 (merge or select first)")
@@ -373,6 +380,29 @@ def check(rig, notes: Optional[dict] = None, bake: Optional[dict] = None) -> lis
         from .safety import check_bake
         issues.extend(check_bake(d, bake)[0])
     return issues
+
+
+def _check_blend(o, where, kind, color, err, warn):
+    """output.blend: replace (default) | multiply (values are gains on the target's own animation) | add (offsets)"""
+    blend = o.get("blend", "replace")
+    if blend is None or blend == "replace":
+        return
+    if blend not in BLENDS:
+        err(where, f"blend {blend!r} not in {list(BLENDS)}")
+        return
+    if kind == "transform":
+        err(where, f"blend {blend!r} does not apply to transform outputs: they blend through target.additive "
+                   "(true, the default, = an offset on the actor's own animation)")
+        return
+    if color:                                       # colour gains / offsets are per RGBA component; no min/max
+        return
+    what = ("gain range (1 = the base unchanged), e.g. 0.6 and 1.5" if blend == "multiply"
+            else "offset range in the target's units (0 = the base unchanged), e.g. -0.2 and 0.5")
+    missing = [k for k in ("min", "max") if o.get(k) is None]
+    if missing:
+        err(where, f"blend {blend!r} needs min and max: the {what} (the 0..1 default would be taken literally)")
+    elif blend == "multiply" and _num(o["min"]) and _num(o["max"]) and min(o["min"], o["max"]) < 0:
+        warn(where, f"blend multiply with a negative gain ({o['min']}..{o['max']}) flips the base's sign")
 
 
 def _check_v02_node(n, where, err, warn, scene, scene_actors):
@@ -404,10 +434,14 @@ def _check_v02_node(n, where, err, warn, scene, scene_actors):
             err(where, f"grid {n.get('grid')!r} is not a grid like '1/16' or a number of beats")
     if op == "accumulate" and n.get("wrap"):
         warn(where, "wrap jumps back instantly at every wrap (rule 2); fine for a shader phase, not for a transform")
+    if op == "beats" and n.get("min_confidence") is not None and (not _num(n["min_confidence"]) or not 0 <= n["min_confidence"] <= 1):
+        err(where, "min_confidence must be within 0..1")
     if op == "flash_limit":
         for k in ("max_flashes_per_s", "min_swing"):
             if n.get(k) is not None and (not _num(n[k]) or n[k] <= 0):
                 err(where, f"{k} must be > 0")
+        if _num(n.get("max_flashes_per_s")) and 0 < n["max_flashes_per_s"] < 1:
+            warn(where, "max_flashes_per_s below 1: no flash fits the 1 s window rule, so triggers pass nothing")
     if op == "ripple":
         nb = n.get("neighbours", 2)
         if nb == "knn":

@@ -32,6 +32,7 @@ class FakeEditor:
         self.tracks = {}                  # sequence -> {output id: hash}
         self.throttled = True
         self.stale_once = False
+        self.base_edited = set()          # blended outputs whose base section was edited in the editor
         self.src = K.source_hash(os.path.join(ROOT, "ue"))
 
     def handle(self, req):
@@ -56,8 +57,11 @@ class FakeEditor:
                 seq[o["id"]] = (a.get("hashes") or {}).get(o["id"], "applied")
             for oid in a.get("remove") or []:
                 seq.pop(oid, None)
-            stale = sorted(i for i, (h, n) in (a.get("expect") or {}).items() if seq.get(i) != h)
+            moved = sorted(i for i in (a.get("expect") or {}) if i in self.base_edited)
+            stale = sorted(i for i, (h, n) in (a.get("expect") or {}).items() if seq.get(i) != h or i in moved)
+            self.base_edited -= {o["id"] for o in outs}
             return {"ok": True, "written": [{"tag": f"beatrig:{o['id']}"} for o in outs], "errors": [],
+                    "base_edited": moved,
                     "keys": sum(len(c["keys"]) for o in outs for c in o["channels"]), "stale": stale,
                     "refreshed": False, "write_ms": 1.0, "replaced": 0, "bindings": {"before": 0, "after": 0}}
         if op == "undo":
@@ -160,6 +164,51 @@ def test_output_hash_follows_what_the_applier_writes():
     assert output_hash(o3, 30) != h
     s = slim_bake(b, {"glow"})
     assert [x["id"] for x in s["outputs"]] == ["glow"] and "values" not in s["outputs"][0]["channels"][0]
+
+
+def test_blend_travels_and_counts_in_the_hash():
+    b = bake3()
+    o = b["outputs"][2]
+    h = output_hash(o, 30)
+    assert "blend" not in slim_bake(b)["outputs"][2]                        # replace stays implicit (v0.2 hashes hold)
+    o["blend"] = "replace"
+    assert output_hash(o, 30) == h and "blend" not in slim_bake(b)["outputs"][2]
+    o["blend"] = "multiply"
+    hm = output_hash(o, 30)
+    assert hm != h and slim_bake(b)["outputs"][2]["blend"] == "multiply"
+    o["blend"] = "add"
+    assert output_hash(o, 30) not in (h, hm)
+    assert output_hash(o, 30, tolerance=0.01) != output_hash(o, 30, tolerance=0.002)
+    b["key_tolerance"] = 0.01
+    assert slim_bake(b)["key_tolerance"] == 0.01 and "key_tolerance" not in slim_bake(bake3())
+
+
+def test_bake_start_frame_travels_and_moves_the_hash(rc):
+    editor, host, _ = rc
+    b = bake3()
+    assert "start_frame" not in slim_bake(b)
+    with Link(host, keep_awake=False) as link:
+        link.push(b, "/Game/Show/LS")
+        b2 = copy.deepcopy(b)
+        b2["start_frame"] = 300                                              # same keys, later in the sequence
+        r = link.push(b2, "/Game/Show/LS")
+        assert r["pushed"] == ["lights", "orbs", "glow"]                     # every output moved: all rewritten
+        assert editor.ops[-1][1]["bake"]["start_frame"] == 300
+        assert link.push(b2, "/Game/Show/LS")["pushed"] == []
+
+
+def test_push_rewrites_a_blended_output_whose_base_was_edited(rc):
+    editor, host, _ = rc
+    b = bake3()
+    b["outputs"][2]["blend"] = "multiply"
+    with Link(host, keep_awake=False) as link:
+        assert link.push(b, "/Game/Show/LS")["pushed"] == ["lights", "orbs", "glow"]
+        editor.base_edited.add("glow")                                       # the animator edited the base keys
+        r = link.push(b, "/Game/Show/LS")
+        assert r["base_edited"] == ["glow"] and r["pushed"] == ["glow"] and r["calls"] == 2
+        assert editor.ops[-1][1]["bake"]["outputs"][0]["blend"] == "multiply"
+        r = link.push(b, "/Game/Show/LS")
+        assert r["pushed"] == [] and r["calls"] == 1 and r["base_edited"] == []
 
 
 def test_boots_once_and_keeps_one_connection(rc):

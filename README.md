@@ -131,6 +131,8 @@ targets.
 - **Outputs** map a node to a target: a set of lights (`light`), a material parameter on actors (`material`), a
   material parameter collection (`mpc`), Niagara user parameters (`niagara`) or an additive transform channel
   (`transform`), scaled into `min`..`max`, or written as colour.
+- **Blend**: an output can `multiply` or `add` onto animation the sequence already has (an animator's keys on an MPC,
+  a light), instead of replacing it. beatrig layers its gain on top and never edits the original keys.
 - **Safety**: a `safety` block makes `check` and `bake` refuse any light or emissive output that flashes more than
   three times in a second (the general-flash rule; a dome fills the whole field of view).
 - **Bake** writes `bake.json`: for every output channel the per-frame values and a simplified set of linear keys
@@ -172,6 +174,10 @@ Level Sequence:
 | `material` | a component material track on each actor's mesh: a scalar or a vector parameter |
 | `niagara` | a Niagara float user-parameter track on each actor's Niagara component |
 | `transform` | an additive 3D transform section: location, rotation or scale on one axis, on top of existing animation |
+
+Outputs with `blend: multiply` or `add` are written as an additive layer over the target's existing section (or an
+absolute section of static value × gain when nothing animates it yet), so the original keys are never modified and
+`undo` only removes the layer.
 
 Every key is linear, so curves can't overshoot between keys. Every track it creates is named
 `beatrig:<output id>[:<actor>]` and every binding it creates is tagged. `undo` removes exactly those tracks and
@@ -238,7 +244,7 @@ at runtime from tick time can't promise that.
 
 ## Status
 
-v0.2.0. The test suite (102 tests) passes on Windows with Python 3.14; CI runs it on Ubuntu and Windows with Python
+v0.3.0. The test suite (134 tests) passes on Windows with Python 3.14; CI runs it on Ubuntu and Windows with Python
 3.11 and 3.12. The CLI, preview page, MCP server and live link have been run by hand on Windows against UE 5.8.3.
 
 | Part | Status |
@@ -248,7 +254,7 @@ v0.2.0. The test suite (102 tests) passes on Windows with Python 3.14; CI runs i
 | Preview page | Checked by hand in a browser |
 | MCP server | Run end to end over stdio with the MCP Python SDK client (list tools, analyze, describe_audio, rig and notes edits, bake, plot, preview notify); no automated test yet |
 | `ue/keys.py` (tick maths, key planning, undo tags) | Tested: pytest |
-| `ue/beatrig_apply.py` (the in-editor applier) | Tested live in UE 5.8.3 for every target kind (scalar, colour, transform, Niagara): apply, key-for-key `check`, re-apply in place, `undo` including bindings. Transform and colour values were read back off the actors at the playhead |
+| `ue/beatrig_apply.py` (the in-editor applier) | Tested live in UE 5.8.3 for every target kind (scalar, colour, transform, Niagara) and for `multiply`/`add` blends on MPC, light and material targets: apply, key-for-key `check`, re-apply in place, `undo` including bindings. Transform and colour values were read back off the actors at the playhead |
 | Live link, scan, playhead sync | Tested live in UE 5.8.3; timings above. Unit tests run against a fake Remote Control server |
 | `ue_apply` / `ue_check` / `ue_undo` / `ue_scan` / `live_push` over MCP | Run by hand against UE 5.8.3 |
 | Niagara targets | Track, parameter name and keys verified; the value reaching a running system has not been checked (no template declares a user parameter) |

@@ -20,6 +20,7 @@ from . import safety as safety_mod
 
 log = logging.getLogger("beatrig")
 BAKE_VERSION = 1
+DEFAULT_KEY_TOLERANCE = 0.002                               # rig bake.key_tolerance: RDP error / |max - min|
 
 
 # ---------- setup
@@ -42,8 +43,9 @@ def analysis_reqs(rig: Rig, stem=None) -> list:
 
 
 def analyze(rig: Rig, use_cache: bool = True) -> Optional[Analysis]:
-    """Build or load the analysis cache (analysis.json/.npz next to the rig) and compute every band the rig uses.
-    Returns None for a rig without audio. The cache is invalidated by the audio's size/mtime or the analysis settings.
+    """Build or load the analysis cache (analysis.json/.npz in rig.cache_dir, default next to the rig) and compute every
+    band the rig uses. Returns None for a rig without audio. The cache is invalidated by the audio's size/mtime or the
+    analysis settings.
     Nodes that read a stem ("stem": "drums") also get that stem's analysis (cached in the stem folder) as
     analysis.stems[name]; the stems must have been separated first (beatrig stems <rig>)."""
     if not rig.audio_path:
@@ -51,7 +53,7 @@ def analyze(rig: Rig, use_cache: bool = True) -> Optional[Analysis]:
     if not os.path.exists(rig.audio_path):
         hint = " (generate the demo track with: python examples/make_demo_audio.py)" if "demo_110bpm" in rig.audio_path else ""
         raise RigError(f"audio not found: {rig.audio_path}{hint}")
-    a = open_analysis(rig.audio_path, rig.base_dir, rig.data.get("analysis"), rig.data.get("channel_weights"), use_cache)
+    a = open_analysis(rig.audio_path, rig.cache_dir, rig.data.get("analysis"), rig.data.get("channel_weights"), use_cache)
     a.ensure(analysis_reqs(rig))
     a.save()
     a.stems = open_stems(rig, use_cache)
@@ -79,7 +81,8 @@ def open_stems(rig: Rig, use_cache: bool = True) -> dict:
 
 
 def frame_count(rig: Rig, analysis: Optional[Analysis]) -> int:
-    """frames = rig.frames, else the audio window (audio_in_s .. audio_out_s or the end of the file) plus the offset"""
+    """frames baked = rig.frames, else from bake.start_frame (default 0) to the end of the audio window (audio_in_s ..
+    audio_out_s or the end of the file, which ends at sequence frame offset + its length)"""
     if rig.data.get("frames") is not None:
         return int(rig.data["frames"])
     if analysis is None:
@@ -88,7 +91,10 @@ def frame_count(rig: Rig, analysis: Optional[Analysis]) -> int:
     span = end - rig.audio_in_s
     if span <= 0:
         raise RigError(f"audio window {rig.audio_in_s}..{end} s is empty (the file is {analysis.duration:.3f} s)")
-    return int(math.ceil(round(span * rig.fps, 6))) + rig.offset
+    end = int(math.ceil(round(span * rig.fps, 6))) + rig.offset
+    if end <= rig.start_frame:
+        raise RigError(f"bake.start_frame {rig.start_frame} is at or past the end of the audio window (frame {end})")
+    return end - rig.start_frame
 
 
 def resolve_tempo(rig: Rig, analysis: Optional[Analysis], notes: Optional[dict]) -> Tempo:
@@ -119,15 +125,16 @@ def resolve_tempo(rig: Rig, analysis: Optional[Analysis], notes: Optional[dict])
 
 def make_ctx(rig, analysis, notes):
     sset, _ = safety_mod.settings(rig.data)
-    ctx = Ctx(rig.fps, frame_count(rig, analysis), rig.offset, resolve_tempo(rig, analysis, notes), analysis, notes, rig.seed,
-              rig.data.get("channel_weights"), t0=rig.audio_in_s, scene=rig.load_scene(), safety=sset,
-              stems=getattr(analysis, "stems", None) or {})
+    ctx = Ctx(rig.fps, frame_count(rig, analysis), rig.offset - rig.start_frame, resolve_tempo(rig, analysis, notes), analysis,
+              notes, rig.seed, rig.data.get("channel_weights"), t0=rig.audio_in_s, scene=rig.load_scene(), safety=sset,
+              stems=getattr(analysis, "stems", None) or {}, start=rig.start_frame)
     ctx.rig_nodes = rig.resolved_nodes()
     return ctx
 
 
 def evaluate(rig: Rig, analysis: Optional[Analysis] = None, notes: Optional[dict] = None, ctx: Optional[Ctx] = None) -> dict:
-    """Evaluate every node in dependency order. Returns {node_id: Signal} (Signal.v is float32 [channels, frames])."""
+    """Evaluate every node in dependency order. Returns {node_id: Signal} (Signal.v is float32 [channels, frames]; frame
+    i is sequence frame bake.start_frame + i)."""
     if notes is None:
         notes = load_notes(rig.notes_path)
     ctx = ctx or make_ctx(rig, analysis, notes)
@@ -174,14 +181,15 @@ def resolve_layer_keys(keys: list, sections: dict) -> list:
     return out
 
 
-def layer_curve(keys: list, frames: int) -> np.ndarray:
-    """intensity per frame. A key {frame, value, ease, fade_frames} starts its fade AT `frame` and reaches `value` at
-    frame + fade_frames (0 = a cut). Before the first key the first value holds."""
+def layer_curve(keys: list, frames: int, start: int = 0) -> np.ndarray:
+    """intensity per frame for sequence frames start .. start + frames - 1. A key {frame, value, ease, fade_frames}
+    (sequence frames) starts its fade AT `frame` and reaches `value` at frame + fade_frames (0 = a cut). Before the
+    first key the first value holds."""
     v = np.ones(frames)
     if not keys:
         return v
     keys = sorted(keys, key=lambda k: k["frame"])
-    f = np.arange(frames, dtype=np.float64)
+    f = np.arange(start, start + frames, dtype=np.float64)
     cur = float(keys[0]["value"])
     v[:] = cur
     rest = keys[1:]
@@ -258,7 +266,9 @@ def bake(rig: Rig, analysis: Optional[Analysis] = None, notes: Optional[dict] = 
     """Validate, evaluate and bake. Returns the bake.json structure; writes it to `out` if given. Raises RigError with
     every check error if the rig is invalid. Same inputs -> byte-identical file.
     Flash safety runs on the baked values: with a rig "safety" block a violation is an error (RigError unless
-    strict=False); without one it is reported in result["safety"] only."""
+    strict=False); without one it is reported in result["safety"] only.
+    rig.bake.start_frame S (default 0): only sequence frames S .. S + frames - 1 are evaluated and baked; values and key
+    frames index that range, and the result carries "start_frame": S when S > 0."""
     if notes is None:
         notes = load_notes(rig.notes_path)
     errors = [i for i in check(rig, notes) if i["level"] == "error"]
@@ -270,9 +280,9 @@ def bake(rig: Rig, analysis: Optional[Analysis] = None, notes: Optional[dict] = 
     ctx = make_ctx(rig, analysis, notes)
     sigs = signals if signals is not None else evaluate(rig, analysis, notes, ctx)
     secs = section_frames(notes, rig.fps, rig.offset, rig.audio_in_s)
-    layers = {L["id"]: layer_curve(resolve_layer_keys(L.get("intensity", []), secs), ctx.frames) for L in rig.layers}
+    layers = {L["id"]: layer_curve(resolve_layer_keys(L.get("intensity", []), secs), ctx.frames, ctx.start) for L in rig.layers}
     bk = rig.data.get("bake") or {}
-    tol_rel, dec = float(bk.get("key_tolerance", 0.002)), int(bk.get("decimals", 4))
+    tol_rel, dec = float(bk.get("key_tolerance", DEFAULT_KEY_TOLERANCE)), int(bk.get("decimals", 4))
     hashes = {"rig_hash": rig.hash, "notes_hash": sha256(normalise(notes))}
     gc_on = gc.isenabled()
     gc.disable()        # millions of small value/key lists: the cyclic GC would re-scan them over and over (they hold no cycles)
@@ -280,6 +290,10 @@ def bake(rig: Rig, analysis: Optional[Analysis] = None, notes: Optional[dict] = 
         outs, arrays = _bake_outputs(rig, sigs, layers, ctx, tol_rel, dec)
         result = {"version": BAKE_VERSION, "fps": rig.data.get("fps", 30), "frames": ctx.frames, "audio": rig.data.get("audio"),
                   "audio_offset_frames": rig.offset}
+        if ctx.start:                                        # values[0] / key frame 0 = this sequence frame (0: left out)
+            result["start_frame"] = ctx.start
+        if tol_rel != DEFAULT_KEY_TOLERANCE:                 # the applier re-simplifies blended keys with it (default: left out)
+            result["key_tolerance"] = tol_rel
         if rig.data.get("audio_in_s") is not None or rig.data.get("audio_out_s") is not None:
             result["audio_in_s"] = rig.audio_in_s
             result["audio_out_s"] = rig.audio_out_s
@@ -300,7 +314,9 @@ def bake(rig: Rig, analysis: Optional[Analysis] = None, notes: Optional[dict] = 
 
 
 def _bake_outputs(rig, sigs, layers, ctx, tol_rel, dec):
-    """(bake.json outputs, {output id: per-channel value arrays}) for every rig output"""
+    """(bake.json outputs, {output id: per-channel value arrays}) for every rig output. An output with blend "multiply"
+    or "add" bakes the same way (its values are gains or offsets on the target's own animation, applied in the editor)
+    and carries "blend" in bake.json; "replace" (the default) is left implicit."""
     outs, arrays = [], {}
     for o in rig.outputs:
         s = sigs[o["signal"]]
@@ -311,10 +327,13 @@ def _bake_outputs(rig, sigs, layers, ctx, tol_rel, dec):
         entry = {"id": o["id"]}
         if o.get("layer"):
             entry["layer"] = o["layer"]
+        blend = o.get("blend") or "replace"
         if s.kind == "color":
             chans, arrays[o["id"]] = color_channels(s, names, inten, tol_rel, dec, with_arrays=True)
             entry.update({"signal": o["signal"], "value_type": "color", "target": dict(target, value_type="color"),
                           "channels": chans})
+            if blend != "replace":
+                entry["blend"] = blend
             outs.append(entry)
             continue
         lo, hi = float(o.get("min", 0.0)), float(o.get("max", 1.0))
@@ -329,6 +348,8 @@ def _bake_outputs(rig, sigs, layers, ctx, tol_rel, dec):
             chans.append(ch)
             arrays[o["id"]].append(vals)
         entry.update({"signal": o["signal"], "target": target, "min": lo, "max": hi, "channels": chans})
+        if blend != "replace":                               # "replace" stays implicit: v0.2 rigs bake byte-identically
+            entry["blend"] = blend
         outs.append(entry)
     return outs, arrays
 

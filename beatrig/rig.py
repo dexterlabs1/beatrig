@@ -45,6 +45,17 @@ class Rig:
         return self.resolve(self.data.get("notes", "notes.json"))
 
     @property
+    def cache_dir(self):
+        """where the analysis cache lives: rig.cache_dir (relative to the rig), else the rig's own folder. Scene rigs cut
+        from one show mix point at one folder and share one analysis."""
+        return self.resolve(self.data.get("cache_dir")) or self.base_dir
+
+    @property
+    def start_frame(self):
+        """bake.start_frame: the first sequence frame baked (default 0). Frames before it are not evaluated at all."""
+        return int((self.data.get("bake") or {}).get("start_frame") or 0)
+
+    @property
     def fps(self):
         return float(self.data.get("fps", 30))
 

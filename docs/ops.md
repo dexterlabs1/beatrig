@@ -1,4 +1,4 @@
-# beatrig ops reference (v0.2)
+# beatrig ops reference (v0.3)
 
 The file formats are specified in [the design doc](design.md). This page is the op-by-op reference, plus the semantics
 the engine settles where the design doc leaves room. Params in brackets are optional (shown with their defaults).
@@ -22,7 +22,7 @@ keep. Sources set it, delays and chases move it, `math` unions it, and shaping o
 | `band` | `lo`, `hi` (Hz), [`attack_ms` 10, `release_ms` 150, `weights` null, `stem` null] | 1 ch, raw linear amplitude | Butterworth band (order 4, low/high-pass at the edges). Per-channel power is weighted and summed, so channels can't phase-cancel. Then a one-pole follower runs on an exact 1 ms grid, sampled at each frame's start. `weights` (one per audio channel) defaults to the rig's `channel_weights`, else equal. `stem` (`drums`, `bass`, `vocals`, `other`) reads a separated stem instead of the mix (see Stems). |
 | `loudness` | [`attack_ms` 10, `release_ms` 150, `weights`, `stem`] | 1 ch | Same as `band`, with the ITU-R BS.1770 K-weighting filter (computed for any sample rate). |
 | `onsets` | [`in`, `threshold` 0.3, `min_gap_ms` 80, `stem`] | trigger, 1 ch | Causal spectral-flux peaks on a 5 ms grid. `in` is a `band` node id, an inline `{lo, hi}`, or omitted for the full-range octave-band flux. Velocity is the peak relative to the 95th percentile of all peaks. Peaks below `threshold` are dropped. The onset time is when the rise is known (`(k+1)·5 ms`). The stem is the node's own `stem`, else the referenced band's. |
-| `beats` | [`every` 1, `offset` 0, `subdivide` 1] | trigger, 1 ch | The **verified** beat grid from the analysis. Beats exist only where a real onset supports them. `offset` is an index offset into the beat list for `every`. `subdivide` inserts evenly spaced hits sized from the **previous** interval (causal), never past the next real beat. Subdivision velocity is 0.6 × the beat's. |
+| `beats` | [`every` 1, `offset` 0, `subdivide` 1, `min_confidence` 0, `velocity` strength] | trigger, 1 ch | The **verified** beat grid from the analysis. Beats exist only where a real onset supports them. `offset` is an index offset into the beat list for `every`. `subdivide` inserts evenly spaced hits sized from the **previous** interval (causal), never past the next real beat. Subdivision velocity is 0.6 × the beat's. `min_confidence` (0..1) drops beats whose analysis confidence is below it, together with their subdivisions; it applies after `every`/`offset`, so bar counting stays on the full grid. `velocity` `confidence` uses each beat's confidence as the hit velocity instead of its onset strength. `notes init --from beats --min-conf X` fills a track the same way. |
 | `notes` | `track` | trigger, 1 ch | Hits from `notes.json`. Per-hit `len_beats` and `shape` travel with the trigger to `envelope`. |
 | `lfo` | [`shape` sine, `rate_beats` \| `rate_hz`, `phase` 0, `channels` 1, `phase_step` 0] | N ch, 0..1 | `rate_beats` = beats per cycle, locked to the tempo map and grid offset. `rate_hz` = cycles per second of audio time. Shapes: `sine` (starts at 0), `tri`, `saw_up`, `saw_down`, `square` (check warns: instant edges), `semi_sine`. Channel c gets `phase + c·phase_step`. Default rate: 1 beat. |
 | `const` | [`value` 0, `channels` 1] | N ch | |
@@ -98,6 +98,23 @@ The RDP runs on the 4-vector: every component stays within `key_tolerance` × th
 scale units; with `additive` (the default) the applier writes them as an offset on top of the actor's own animation.
 Pair with `accumulate` for continuous spin (`min` 0, `max` 360 → one turn per unit).
 
+## Output blend (v0.3)
+`output.blend` = `replace` (the default; v0.2 behaviour), `multiply` or `add`. With `multiply` the baked values are
+**gains** and with `add` **offsets**, applied in the editor on top of the target's own animation (its base: the first
+non-beatrig section already driving that target, else its static value; see the design doc for the applier side).
+The engine never sees the base, so a blended output bakes exactly like a replace one: `min + (value · intensity) ·
+(max − min)`, e.g. a gain from 0.6 to 1.55. Two consequences of that formula: signal 0 gives `min` (not the neutral
+1 or 0), and so does a layer faded to 0. Put the neutral value inside the range where the music is quiet.
+
+- `check`: value outputs with `multiply` or `add` need explicit `min` and `max` (the gain range, where 1 = the base
+  unchanged, or the offset range in the target's units, where 0 = unchanged). The 0..1 default would be taken
+  literally, and a gain of 0 blacks out the base. A negative gain warns (it flips the base's sign). Colour outputs
+  blend per RGBA component (`multiply`: per-component gains such as [1.2, 1, 0.8, 1]; `add`: offsets) and take no
+  min/max, as before. Transform outputs reject `blend`: they already blend through `target.additive`.
+- bake.json: the output entry carries `"blend": "multiply" | "add"`. A replace output carries no `blend` key, so a
+  v0.2 rig bakes byte-identically (read a missing key as `replace`).
+- Flash safety judges the baked gain or offset curve against its own `min`..`max`, as for any output.
+
 ## Spatial (real positions from scene.json)
 A rig points at a scene scan with `"scene": "scene.json"` (format in the design doc). Units are Unreal's: cm, rotations
 `[pitch, yaw, roll]` in degrees. Channel i = `actors[i]` after `@group` expansion. The input is 1 channel (broadcast)
@@ -143,7 +160,7 @@ ends (the first frame of its extreme).
 
 | op | params | notes |
 |---|---|---|
-| `flash_limit` | [`max_flashes_per_s`, `min_swing` (default: rig.safety, else 3 and 0.1), `mode` drop] | Causal: it only drops, delays or holds. **Triggers**: a hit closer than 1 / max_flashes_per_s s to the last one passed is dropped, or with `mode` `delay` held until allowed (several held hits merge into one, the strongest). Put it before the envelope. **Values** (0..1 assumed, so `min_swing` is in signal units): while the trailing second already holds 2·max − 1 transitions, the output holds just short of completing another, then follows again. A safe signal passes unchanged. |
+| `flash_limit` | [`max_flashes_per_s`, `min_swing` (default: rig.safety, else 3 and 0.1), `mode` first] | **Triggers** (put it before the envelope): kept hits are at least 1 / max_flashes_per_s s apart, and no 1 s window holds more than floor(max_flashes_per_s) of them, so `flash_report` passes on the result at any rate. At a whole-number rate the spacing alone ensures the window rule; at 2.5 per second hits may be 12 frames apart (at 30 fps) but the third waits until the first has left the window. Below 1 per second no flash fits the 1 s rule, so nothing passes (check warns). Modes: `first` (the default; `drop` is its v0.2 name) passes a hit when the rules allow it and drops the rest; causal. `delay` holds a refused hit until the rules allow it (several held hits merge into one, the strongest); causal. `strongest` is an **offline choice**: hits are taken strongest first (the earliest on a tie), and a hit is kept if it is clear of every kept hit, else dropped. That is the hand-built pipelines' "keep the strongest of close hits". A kept hit stays on its own frame with its own velocity and per-hit `len_beats`/`shape`, so it is never early or late. The output at a frame may depend on later hits (a stronger hit just after removes a weaker one), so this mode is exempt from the truncation rule, but nothing is ever placed ahead of its own sound. **Values** (causal; 0..1 assumed, so `min_swing` is in signal units): while the trailing second already holds 2·max − 1 transitions, the output holds just short of completing another, then follows again. A safe signal passes unchanged. |
 
 ## Layers
 `layers[].intensity` = keys `{frame, value, ease, fade_frames}`. **A key's fade starts at `frame`** and reaches `value` at
@@ -196,13 +213,47 @@ each note's length. Imported hits are added to existing tracks unless `--replace
   records `audio_in_s`/`audio_out_s` when set.
 - `channel_weights`: one weight per audio channel, e.g. 5.1 `[1, 1, 1, 0.5, 0.7, 0.7]` (L R C LFE Ls Rs). They weight
   every band/loudness envelope and the mono mix the beat grid is found on; they are part of the analysis cache key.
-- `beatrig timeline import <file.fcpxml|file.edl> --audio mix.wav --out dir/ [--fps] [--start-tc] [--track V]` writes
-  one stub rig per clip (`NN_<name>.rig.json`, each with its own notes file) plus `timeline.json`. The mix is assumed
-  to start at the timeline's start, so `audio_in_s` is the clip's **timeline** position: FCPXML `offset` − the
-  sequence's `tcStart` (rational times like `1001/30000s`), or EDL record-in − the start timecode (default: the hour of
-  the first event, e.g. 01:00:00:00). EDL timecode is counted at the nominal rate and converted to real seconds
-  (29.97 → 30000/1001), with drop-frame (`;` or `FCM: DROP FRAME`) handled. FCPXML reads the first sequence's primary
-  storyline (gaps and transitions skipped); EDL takes one entry per event number (the incoming clip of a dissolve).
+- `beatrig timeline import <file.fcpxml|file.edl> --audio mix.wav --out dir/ [--fps] [--start-tc] [--track V]
+  [--handles N] [--source-start-tc TC]` writes one stub rig per clip (`NN_<name>.rig.json`, each with its own notes
+  file) plus `timeline.json`. The mix is assumed to start at the timeline's start, so `audio_in_s` is the clip's
+  **timeline** position: FCPXML `offset` − the sequence's `tcStart` (rational times like `1001/30000s`), or EDL
+  record-in − the start timecode (default: the hour of the first event, e.g. 01:00:00:00). EDL timecode is counted at
+  the nominal rate and converted to real seconds (29.97 → 30000/1001), with drop-frame (`;` or `FCM: DROP FRAME`)
+  handled. FCPXML reads the edit's sequence (a project's, not a compound clip's in `<resources>`), primary storyline,
+  gaps skipped; EDL takes one entry per event number (the incoming clip of a dissolve).
+- **Source in-point (v0.3).** Each clip's in-point inside its media becomes the rig's `audio_offset_frames`, so the
+  rig's frames are **media** frames: frame `source_in` plays the clip's first timeline frame, and keys land where the
+  scene's own sequence needs them. FCPXML: `asset-clip` `start` − the asset's `start`; `ref-clip` (a compound clip)
+  `start` − that compound sequence's `tcStart`; `clip` / `sync-clip` through its first media child (child `start` +
+  clip `start` − child `offset`); no `start` = 0; a `title` = 0. EDL: source-in − `--source-start-tc` (default
+  00:00:00:00). An in-point off the frame grid is rounded to the nearest frame, with a warning.
+- **Transitions and handles.** Each clip records the transition right before it (`transition_in`) and right after it
+  (`transition_out`) as `{name, start_s, end_s, frames}` in timeline seconds, and `handles_needed` = [frames before
+  the in point, frames after the out point] that those transitions use. FCPXML transitions are the `<transition>`
+  elements next to the clip in the spine (a gap in between means none); an EDL dissolve or wipe (`D 030`, `W001 015`)
+  starts at the incoming event's record-in, so the outgoing clip needs `frames` after its out point and the incoming
+  one none before. Each rig bakes only its clip plus `--handles N` frames on either side: `bake.start_frame` =
+  source in − N (clamped at the media's frame 0) and `audio_out_s` = the out point + N frames, so a clip whose source
+  in is frame 600 bakes 15 + its length + 15 frames with N = 15, not 600 frames of other clips' music. Handle frames
+  read the mix beyond the cut, which is what plays under a dissolve. The importer warns when a clip's transitions
+  need more than N (or than the media has before the in point).
+- Each rig carries `"_timeline": {clip, timeline_in_s, timeline_out_s, source_in_s, source_in_frames, transition_in,
+  transition_out, handles: {before, after}, handles_needed}`, and `timeline.json` repeats it per clip with
+  `audio_offset_frames` and `start_frame`.
+
+## Baked range: `bake.start_frame` (v0.3)
+`rig.bake.start_frame` (default 0) is the first sequence frame baked. Only sequence frames `start_frame` ..
+`start_frame + frames − 1` are evaluated: `frames` is `rig.frames` when set, else the rest of the audio window
+(window end − start_frame). Sequence frames still mean what they did: `audio_offset_frames`, layer key frames and
+`tempo.map` frames are sequence frames, and a frame reads the same audio whatever the start. What changes:
+- Whole-bake statistics see only the baked range (`normalize`'s percentiles, the flash-safety check).
+- Anything carried from before the start begins fresh at it: `smooth` / `spring` / `hold` / `accumulate` state, an
+  envelope tail from a hit before the start, `cycle` / `every_n` counting, `flash_limit` state. `band`, `loudness`,
+  `onsets`, `beats`, `notes`, `lfo` and `probability` (whose draw is keyed by sequence frame) give exactly the values
+  they give in a bake from frame 0.
+- bake.json: `values[0]` and key frame 0 are sequence frame `start_frame`, and the result carries `"start_frame"` (left
+  out when 0, so other rigs bake byte-identically). Flash-safety windows are in seconds from the start of the baked
+  range. The applier lands key frame f on sequence frame `start_frame` + f.
 
 ## Stems (optional extra: `pip install beatrig[stems]`)
 `beatrig stems <rig> [--device cuda|cpu]` separates drums/bass/vocals/other with htdemucs and caches them as wav next to
@@ -226,12 +277,19 @@ carry a little pre-echo, so check onset timing on your material. The core instal
   pure read, and only a new band (or a new file / new settings) writes it.
 - rig (v0.2): `scene`, `groups`, `safety`, `audio_in_s`, `audio_out_s` (above). bake.json (v0.2): `safety` summary,
   `audio_in_s`/`audio_out_s` when set, colour channels, targets with groups expanded.
+- rig (v0.3): `cache_dir`, the folder of the analysis cache (relative to the rig; default the rig's own folder).
+  Scene rigs in their own folders that point at one `cache_dir` and the same mix share one analysis: the first
+  `analyze` builds it and the rest only read it. They must agree on `analysis` settings and `channel_weights`, which
+  are part of the cache key (otherwise each rebuilds and overwrites it). Per output `blend` (above).
+  `bake.start_frame` (above). bake.json (v0.3): `blend` on multiply/add outputs; `start_frame` when it isn't 0;
+  `key_tolerance` (top level) when the rig sets a `bake.key_tolerance` other than the default 0.002, so the applier
+  re-simplifies blended keys with the same tolerance.
 
 ## Python API
 ```python
 import beatrig
 rig = beatrig.load_rig("rig.json")              # Rig; Rig.from_dict(d, base_dir) for in-memory rigs
-an = beatrig.analyze(rig)                        # Analysis (cached next to the rig) or None without audio
+an = beatrig.analyze(rig)                        # Analysis (cached in rig.cache_dir, default next to the rig) or None
 sig = beatrig.evaluate(rig, an, notes)           # {node_id: Signal}; Signal.v is float32 [channels, frames]
 res = beatrig.bake(rig, an, notes, out="bake.json")
 res = beatrig.bake_from_objects(rig_dict, notes_dict, base_dir)   # unsaved rig/notes; notes_dict None = read the file
@@ -245,6 +303,6 @@ secs, levels = beatrig.section_boundaries(an); beatrig.name_sections(secs)
 beatrig.make_pattern(notes, "kick4", 4, hits=[{"beat": 0, "vel": 1}]); beatrig.place_pattern(notes, "kick", "kick4", 16, 4)
 beatrig.track_hits(notes, "kick")                # plain + freshly expanded pattern hits
 beatrig.import_midi("drums.mid", "36:kick,38:snare", channel=10)    # {"bpm_map", "grid_offset", "tracks", "stats"}
-beatrig.import_timeline("edit.fcpxml", "mix.wav", "clips/")         # one window rig per clip
+beatrig.import_timeline("edit.fcpxml", "mix.wav", "clips/", handles=15)   # one window rig per clip (+ "warnings")
 beatrig.parse_color("#ff8800"); beatrig.PALETTES["ember"]; beatrig.dome_angles(camera, positions)
 ```

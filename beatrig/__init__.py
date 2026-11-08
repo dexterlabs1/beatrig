@@ -18,6 +18,12 @@ v0.2 additions:
     import_timeline(path, audio, out_dir) -> dict                   FCPXML / EDL -> one window rig per clip
     PALETTES, parse_color(c)                                        named palettes, '#rrggbb' -> linear RGBA
     dome_angles(camera, positions) -> (zenith, azimuth)             fulldome geometry used by dome_wave
+
+v0.3 additions (formats in docs/ops.md):
+    output "blend": replace | multiply | add                       gains / offsets on the target's own animation
+    rig "cache_dir"                                                 scene rigs share one show-mix analysis
+    rig "bake": {"start_frame": S}                                  bake only sequence frames S.. (bake.json "start_frame")
+    import_timeline(path, audio, out_dir, handles=N) -> dict        source in-point -> audio_offset_frames, transitions
 """
 from .analysis import Analysis, name_sections, section_boundaries
 from .bake import analyze, bake, bake_from_objects, evaluate, layer_curve, rdp, resolve_layer_keys, write_bake
@@ -33,7 +39,7 @@ from .spatial import dome_angles
 from .tempo import Tempo
 from .timeline import import_timeline
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["Analysis", "Rig", "RigError", "OpError", "Signal", "Tempo", "load_rig", "analyze", "evaluate", "bake",
            "bake_from_objects", "write_bake", "check", "load_notes", "save_notes", "layer_curve", "rdp", "__version__",
            "flash_report", "expand_patterns", "track_hits", "make_pattern", "place_pattern", "section_boundaries",

@@ -3,6 +3,30 @@
 All notable changes to beatrig. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [0.3.0] - 2026-11-07
+
+Audio-reactive gains on top of a show's existing keys, without touching them.
+
+### Added
+- **Output blend** `multiply` / `add`. Baked values are gains or offsets, applied over the target's existing animation
+  ("base") in the sequence. The base section stays active and untouched: beatrig writes an additive layer holding
+  `base·(gain−1)` (or the offset), so a section shared with other parameters (Sequencer's default for an MPC or a
+  material slot) works. With no base, an absolute section of static × gain is written. Edits to the base are detected
+  on the next push and the layer is rewritten. `undo` removes only the layer. Tested live in UE 5.8.3 on MPC scalar
+  (shared Glow + Tint section), MPC colour, light intensity and a material scalar, in both modes.
+- `beats`: `min_confidence` and `velocity: confidence`; `notes init --from beats --min-conf`.
+- `flash_limit` mode `strongest`: an offline choice that keeps the strongest of close hits at its own frame.
+- `rig.cache_dir`, so scene rigs cut from one show mix share one analysis.
+- `bake.start_frame`: bake only part of the sequence; statistics use only that range.
+- Timeline import records source in-points and transitions, and `--handles N` bakes each clip plus its dissolve
+  handles only.
+
+### Changed
+- `flash_limit` mode `first` is the documented default (`drop` stays as an alias). Every mode caps hits per one-second
+  window, so fractional rates are safe.
+- bake.json carries `"blend"` (non-replace outputs), `"start_frame"` (when not 0) and `"key_tolerance"` (when not the
+  default). Rigs that use none of these bake byte-identically to 0.2.0.
+
 ## [0.2.0] - 2026-11-07
 
 Live editing in Unreal, colour, spatial waves across real scene layouts, flash safety, and a much lighter core.

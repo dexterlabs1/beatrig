@@ -6,8 +6,11 @@ general-flash rule. A channel fails when any 1 s window holds more than `max_fla
 placed at the frame where it ends (its turning point).
 
 flash_report() is pure (values in, report out), so a plot can overlay it. check_bake() turns a bake result into check
-issues. The `flash_limit` op (registered here) enforces the limit causally: it only drops, delays or holds.
+issues. The `flash_limit` op (registered here) enforces the limit: it only drops, delays or holds (causally), or in
+mode "strongest" makes an offline choice among close hits that never moves one.
 """
+import bisect
+import math
 from collections import deque
 
 import numpy as np
@@ -183,34 +186,83 @@ def check_bake(rig_data, result, arrays=None) -> tuple:
 
 
 # ---------- the op
-def _limit_triggers(s, interval, mode):
-    """per channel: hits closer than `interval` frames to the last emitted hit are dropped, or (mode delay) held until
-    the interval has passed (several held hits merge, keeping the strongest). Only drops or delays: never early."""
-    C, N = s.v.shape
+def per_window(rate):
+    """the most hits any 1 s window may hold: flash_report fails a window with more than `rate` flashes, and each hit
+    is one flash, so floor(rate) (0 below 1 per second: no flash fits the rule at all)"""
+    return int(math.floor(float(rate) + 1e-9))
+
+
+def _window_ok(prev, f, k, W):
+    """True if hit f can join `prev` (the emitted hits before it, ascending) without k + 1 hits in one 1 s window"""
+    return k > 0 and (len(prev) < k or f - prev[-k] >= W - 1e-9)
+
+
+def _limit_triggers(s, interval, mode, fps=None, k=None):
+    """per channel: hits closer than `interval` frames to the last emitted hit are dropped (mode first / drop), or
+    (mode delay) held until the interval has passed (several held hits merge, keeping the strongest). Only drops or
+    delays: never early. Any 1 s window (fps frames) also holds at most k hits: at a whole-number rate the spacing
+    already ensures that; at a fractional rate (2.5 per second -> 12 frames apart) it is what keeps the third hit out.
+    Mode strongest: _limit_strongest."""
+    W = float(fps) if fps is not None else interval            # fps None: spacing only (k = 1 hit per interval)
+    k = 1 if k is None else int(k)
+    if mode == "strongest":
+        return _limit_strongest(s, interval, W, k)
+    C, N = s.v.shape                                               # below: "first" (= "drop") and "delay"
     v = np.zeros_like(s.v)
     aux = empty_aux(v.shape)
     for c in range(C):
-        last, pend = -np.inf, None                                 # pend = (frame, vel, src frame)
+        last, pend, sent = -np.inf, None, []                       # pend = (frame, vel, src frame); sent = emitted frames
         def emit(f, vel, src):
             v[c, f] = vel
-            for k in aux:
-                if k in s.aux:
-                    aux[k][c, f] = s.aux[k][c, src]
+            sent.append(f)
+            for key in aux:
+                if key in s.aux:
+                    aux[key][c, f] = s.aux[key][c, src]
         for f in np.flatnonzero(s.v[c] != 0).tolist():
             if pend is not None and pend[0] <= f:
                 emit(*pend)
                 last, pend = pend[0], None
             vel = float(s.v[c, f])
-            if f - last >= interval:
+            if f - last >= interval and _window_ok(sent, f, k, W):
                 emit(f, vel, f)
                 last = f
-            elif mode == "delay":
+            elif mode == "delay" and k > 0:
                 at = int(np.ceil(last + interval - 1e-9))
+                if len(sent) >= k:
+                    at = max(at, int(np.ceil(sent[-k] + W - 1e-9)))
                 if pend is None or vel > pend[1]:
                     pend = (at, vel, f) if at < N else None
         if pend is not None and pend[0] < N:
             emit(*pend)
     return Signal(v, "trigger", v != 0, aux)
+
+
+def _limit_strongest(s, interval, W, k):
+    """offline choice among close hits, per channel: hits are taken strongest first (the earliest on a tie), and a hit
+    is kept only if no kept hit lies closer than `interval` frames and no 1 s window (W frames) would hold more than k
+    kept hits; the rest are dropped. A kept hit stays on its own frame with its own velocity and per-hit len/shape, so
+    nothing moves, early or late. The choice looks at later hits: a frame's output may depend on hits after it (exempt
+    from the truncation rule), but no hit is ever placed ahead of its own sound."""
+    keep = np.zeros(s.v.shape, bool)
+    for c in range(s.channels):
+        idx = np.flatnonzero(s.v[c] != 0)
+        order = idx[np.argsort(-s.v[c, idx].astype(np.float64), kind="stable")]
+        kept = []                                                  # ascending
+        for f in order.tolist():
+            p = bisect.bisect_left(kept, f)
+            if (p > 0 and f - kept[p - 1] < interval) or (p < len(kept) and kept[p] - f < interval):
+                continue
+            near = kept[max(0, p - k):p] + [f] + kept[p:p + k]
+            if k <= 0 or any(near[j + k] - near[j] < W - 1e-9 for j in range(len(near) - k)):
+                continue
+            kept.insert(p, f)
+        keep[c, kept] = True
+    v = np.where(keep, s.v, 0).astype(np.float32)
+    aux = empty_aux(v.shape)
+    for key in aux:
+        if key in s.aux:
+            aux[key] = np.where(keep, s.aux[key], aux[key]).astype(aux[key].dtype)
+    return Signal(v, "trigger", keep, aux)
 
 
 def _limit_values(x, fps, max_per_s, swing):
@@ -261,11 +313,16 @@ def _limit_values(x, fps, max_per_s, swing):
     return out
 
 
-@op("flash_limit", {"max_flashes_per_s": None, "min_swing": None, "mode": "drop"}, kind=lambda n, k: k[0] if k else "value")
+LIMIT_MODES = ["first", "drop", "delay", "strongest"]
+
+
+@op("flash_limit", {"max_flashes_per_s": None, "min_swing": None, "mode": "first"}, kind=lambda n, k: k[0] if k else "value")
 def op_flash_limit(node, ins, ctx):
-    """Causal flash limiter. Triggers: at most max_flashes_per_s hits per second per channel (later hits dropped, or
-    with mode "delay" held until allowed). Values: the output holds short of a new transition (>= min_swing) while the
-    trailing second is already at the limit. Defaults come from rig.safety, else 3 per second and 0.1."""
+    """Flash limiter. Triggers: hits at least 1 / max_flashes_per_s s apart and at most floor(max_flashes_per_s) in any
+    1 s window, per channel: later hits dropped (mode "first", or its v0.2 name "drop"; causal), held until allowed
+    ("delay"; causal), or, offline, the strongest of close hits kept on its own frame and the others dropped
+    ("strongest"). Values (causal): the output holds short of a new transition (>= min_swing) while the trailing second
+    is already at the limit. Defaults come from rig.safety, else 3 per second and 0.1."""
     s = ins[0]
     if s.kind == "color":
         raise OpError(node.get("id"), "flash_limit takes a value or trigger signal (limit the value before gradient)")
@@ -274,10 +331,10 @@ def op_flash_limit(node, ins, ctx):
     if rate <= 0:
         raise OpError(node.get("id"), "max_flashes_per_s must be > 0")
     if s.kind == "trigger":
-        mode = node.get("mode") or "drop"
-        if mode not in ("drop", "delay"):
-            raise OpError(node.get("id"), f"mode {mode!r} not in ['drop', 'delay']")
-        return _limit_triggers(s, ctx.fps / rate, mode)
+        mode = node.get("mode") or "first"
+        if mode not in LIMIT_MODES:
+            raise OpError(node.get("id"), f"mode {mode!r} not in {LIMIT_MODES}")
+        return _limit_triggers(s, ctx.fps / rate, mode, ctx.fps, per_window(rate))
     v = np.stack([_limit_values(row, ctx.fps, rate, swing) for row in s.v])
     return Signal(v, "value", s.hits)
 

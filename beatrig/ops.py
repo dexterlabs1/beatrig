@@ -21,8 +21,10 @@ class Ctx:
     """per-bake constants: frame grid, tempo, analysis, notes"""
 
     def __init__(self, fps, frames, offset, tempo, analysis=None, notes=None, seed=1, default_weights=None, t0=0.0,
-                 scene=None, safety=None, stems=None):
+                 scene=None, safety=None, stems=None, start=0):
+        # frame i of every signal is sequence frame start + i; offset is audio_offset_frames - start (may be < 0)
         self.fps, self.frames, self.offset = float(fps), int(frames), int(offset)
+        self.start = int(start)                                         # rig bake.start_frame
         self.tempo, self.analysis, self.notes, self.seed = tempo, analysis, notes or {}, int(seed)
         self.default_weights = default_weights
         self.t0 = float(t0 or 0.0)                                      # rig audio_in_s: audio time of frame `offset`
@@ -169,12 +171,16 @@ def op_onsets(node, ins, ctx):
 
 def beat_times(node, ctx):
     """verified beats (analysis), every/offset picking, causal subdivision (spacing from the PREVIOUS interval, only
-    up to the next real beat)"""
+    up to the next real beat). v0.3: min_confidence drops beats (and their subdivisions) whose analysis confidence is
+    below it, after every/offset have counted the full grid; velocity "confidence" uses that confidence as the hit
+    velocity instead of the onset strength (subdivisions keep the 0.6 factor)."""
     a = ctx.need_analysis(node)
     bt = np.array([b["time"] for b in a.beats])
-    bv = np.array([b["strength"] for b in a.beats])
+    vel_key = "confidence" if P(node, "velocity") == "confidence" else "strength"
+    bv = np.array([b.get(vel_key, 1.0) for b in a.beats])
+    bc = np.array([b.get("confidence", 1.0) for b in a.beats])
     every, off, sub = int(P(node, "every")), int(P(node, "offset")), int(P(node, "subdivide"))
-    times, vels = list(bt), list(bv)
+    times, vels, confs = list(bt), list(bv), list(bc)
     if sub > 1 and len(bt) > 2:
         T = 60.0 / np.array([ctx.tempo.bpm_at(t) for t in bt])
         for i in range(1, len(bt)):
@@ -187,18 +193,24 @@ def beat_times(node, ctx):
                 if t < nxt - 0.02:
                     times.append(t)
                     vels.append(bv[i] * 0.6)
+                    confs.append(bc[i])
         o = np.argsort(times, kind="stable")
-        times, vels = np.array(times)[o], np.array(vels)[o]
-    times, vels = np.asarray(times), np.asarray(vels)
+        times, vels, confs = np.array(times)[o], np.array(vels)[o], np.array(confs)[o]
+    times, vels, confs = np.asarray(times), np.asarray(vels), np.asarray(confs)
     if every > 1 or off:
         sel = np.arange(len(times))
         sel = sel[(sel - off) % every == 0] if every > 1 else sel[off:]
         sel = sel[sel >= off]
-        times, vels = times[sel], vels[sel]
+        times, vels, confs = times[sel], vels[sel], confs[sel]
+    mc = float(P(node, "min_confidence") or 0.0)
+    if mc > 0:
+        keep = confs >= mc - 1e-9
+        times, vels = times[keep], vels[keep]
     return times, vels
 
 
-@op("beats", {"every": 1, "offset": 0, "subdivide": 1}, inputs=None, kind="trigger", chans=lambda n, c: 1)
+@op("beats", {"every": 1, "offset": 0, "subdivide": 1, "min_confidence": 0.0, "velocity": "strength"}, inputs=None,
+    kind="trigger", chans=lambda n, c: 1)
 def op_beats(node, ins, ctx):
     times, vels = beat_times(node, ctx)
     return hits_signal(ctx.frame_of(times), vels, ctx)

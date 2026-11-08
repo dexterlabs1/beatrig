@@ -239,28 +239,49 @@ When live is on, every successful re-bake pushes changed outputs (a worker threa
 `output.blend` defaults to `"replace"` (v0.2 behaviour). With `"multiply"`, the baked values are **gains**
 (`min + v·(max−min)`, e.g. 0.6..1.55); with `"add"` they are **offsets**. Either way they apply on top of the target's
 existing animation in the sequence (its "base"):
-- **Base:** the first non-beatrig section that already drives that target in the sequence (e.g. the show's own MPC
-  parameter keys, a light's intensity track). If none exists, the base is the target's current static value, read at
-  apply time and recorded.
-- **Applier:**
-  - Evaluate the base at every frame of the bake range.
-  - Compute `final = base × gain` (or `base + offset`).
+- **Base:** the first active non-beatrig section that already drives that target in the sequence (e.g. the show's own
+  MPC parameter keys, a light's intensity track). It stays **active and untouched**, always, so a section shared with
+  other parameters (Sequencer's default for an MPC or a material slot) is fine.
+- **Applier, with a base section:**
+  - Write an **additive** section on the beatrig-tagged track, its blend type set before any key. It holds the
+    offset: `base(t)·(gain(t)−1)` for multiply, with the base evaluated at every frame of the bake range, or
+    `offset(t)` for add.
+  - Put a 0 key one frame each side of the bake range, so frames outside it play exactly the base.
   - Simplify with the same relative-tolerance RDP (pure function in `ue/keys.py`).
-  - Write the result on the beatrig-tagged track.
-  - Set the base section **inactive**: it is kept intact and recorded in the beatrig tag, so it's never destroyed.
-  - `undo` deletes the beatrig track and reactivates the base.
-  - `apply` again re-reads the (inactive) base, so editing the base and re-applying works.
-  - `check` recomputes base × gain from the inactive base and compares key-for-key.
+  - Why additive: two absolute sections on one parameter are averaged by Sequencer, and MPC sections refuse
+    `OVERRIDE`.
+- **No base section:** write an **absolute** section of `static × gain` (or `static + offset`) over the bake range.
+  The static value (MPC default, property value) is read at the first apply and recorded. An additive section with
+  nothing under it would add onto whatever value the world last held.
+- **Record:** the sequence asset's metadata records what each track was applied over: the base section and a
+  fingerprint of its keys, or the static value.
+- **After the apply:**
+  - `check` recomputes the track from the current base and compares key-for-key.
+  - `push` rewrites a multiply output whose base was edited (`base_edited`).
+  - `undo` deletes the beatrig section and its record; there is nothing to reactivate.
+  - Two beatrig blends on one target are refused, since two additive layers would be ambiguous.
+  - Transforms take no `blend`: they already layer on the actor's animation through `target.additive`, and the
+    applier refuses a transform output that has one.
 - **bake.json** carries `"blend"` per output. Values stay gains or offsets; the base is never baked offline (it lives in
   the sequence).
 - `check` (engine): `multiply` needs `min`/`max` meaning a gain range; `add` an offset range. Colour outputs multiply
   per component.
 
 ### Engine additions (v0.3)
-- `beats` op: `min_confidence` (0..1) and `velocity: "strength" | "confidence"`; `notes init --from beats --min-conf X`.
-- `flash_limit`: `mode: "first" | "strongest"`. `strongest` picks the strongest of hits that are too close together,
-  and never moves a hit earlier.
+- `beats` op: `min_confidence` (0..1, filtered after every/offset so bar counting never shifts) and
+  `velocity: "strength" | "confidence"`; `notes init --from beats --min-conf X`.
+- `flash_limit`: `mode: "first"` (default; alias `drop`) | `"delay"` | `"strongest"`. `strongest` is an **offline choice**:
+  among hits closer than the minimum spacing it keeps the strongest (earliest on ties) **at its own frame** and drops
+  the rest. The output at a frame may depend on later hits, but nothing is ever placed ahead of its own sound. Every
+  mode also caps hits at floor(rate) in any one-second window, so fractional rates (e.g. 2.5/s) can't fail the report.
 - `rig.cache_dir`: where the analysis cache lives (relative to the rig). Scene rigs cut from one show mix share one
-  analysis.
-- Timeline import records each clip's `source_in_s` and adjacent transitions, sets `audio_offset_frames` = source in,
-  and offers `--handles N` (frames of media baked before and after each clip, as the dissolves need).
+  analysis; a second rig's analyze is a pure read.
+- `bake.start_frame` (default 0): the first sequence frame baked. Only `[start_frame, start_frame + frames)` is
+  evaluated, whole-bake statistics (normalize percentiles) use only that range, stateful ops start fresh there, and
+  bake.json carries `"start_frame"` when it isn't 0 (index i = sequence frame start_frame + i). The UE applier and the
+  preview page both honour it.
+- bake.json carries a top-level `"key_tolerance"` when the rig sets a non-default one, so the applier's blended keys use
+  the same tolerance.
+- Timeline import records each clip's source in-point and adjacent transitions, sets `audio_offset_frames` = source in,
+  and with `--handles N` bakes only the clip plus N frames each side (`bake.start_frame` = max(0, source_in − N)),
+  never the other clips' audio before it.

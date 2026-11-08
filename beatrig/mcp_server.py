@@ -1031,11 +1031,15 @@ def _bake_file(bake_path):
 
 
 def _ue_result(res, keep=("ok", "sequence", "keys", "replaced", "removed", "errors", "refreshed", "saved", "bindings",
-                          "pushed", "skipped", "calls", "ms", "rt_ms", "editor_ms", "write_ms")):
-    """the editor's result without the per-track list (a count instead)"""
+                          "pushed", "skipped", "base_edited", "calls", "ms", "rt_ms", "editor_ms", "write_ms")):
+    """the editor's result without the per-track list (a count instead, plus the bases of multiply/add tracks)"""
     out = {k: res[k] for k in keep if k in res}
     if "written" in res:
         out["tracks"] = len(res["written"])
+        blended = [{k: w[k] for k in ("tag", "blend", "section", "base", "keys", "warning") if k in w}
+                   for w in res["written"] if w.get("blend")]
+        if blended:
+            out["blended"] = blended[:40]
     if isinstance(out.get("bindings"), dict) and isinstance(out["bindings"].get("pruned"), list):
         out["bindings"] = dict(out["bindings"], pruned=len(out["bindings"]["pruned"]))
     return out
@@ -1047,7 +1051,12 @@ def ue_apply(bake_path: str, sequence_path: str, host: str | None = None, start_
     """Write a bake.json into a Level Sequence in a running Unreal editor (Remote Control on localhost:30010).
     sequence_path is the asset path, e.g. "/Game/Show/LS_Main". Replaces only the tracks beatrig wrote before for these
     outputs (tagged "beatrig:<output id>"). The bake's fps must equal the sequence's display rate. save=true saves the
-    asset. Tested on UE 5.8.3; run ue_check afterwards to compare key for key."""
+    asset. start_frame shifts the bake further (keys land on bake.start_frame + start_frame + key frame).
+    Outputs with blend "multiply"/"add" (values = gains/offsets) go on top of the target's own animation in the
+    sequence: an additive section holding base x (gain - 1) or the offset, with the base section left active and
+    untouched (shared sections are fine); with no base section, an absolute section of static value x gain. "blended"
+    in the result names each track's base. Edit the base and apply (or live_push) again to follow it. One blend per
+    target. Tested on UE 5.8.3; run ue_check afterwards to compare key for key."""
     res = _live(_link(host).apply, _bake_file(bake_path), sequence_path, only or None, int(start_frame), bool(save))
     _notify("ue_apply", f"{sequence_path}: {res.get('keys', 0)} keys, ok={res.get('ok')}")
     return _j(_ue_result(res))
@@ -1056,7 +1065,8 @@ def ue_apply(bake_path: str, sequence_path: str, host: str | None = None, start_
 @tool
 def ue_undo(sequence_path: str, output_id: str | None = None, host: str | None = None, save: bool = False) -> str:
     """Remove the tracks beatrig wrote into a Level Sequence (all of them, or one output's), plus the bindings beatrig
-    created that are now empty. Bindings that were already in the sequence are never removed."""
+    created that are now empty. Bindings that were already in the sequence are never removed, and the base sections
+    under multiply/add outputs were never changed, so they play exactly as before."""
     res = _live(_link(host).undo, sequence_path, output_id, bool(save))
     _notify("ue_undo", f"{sequence_path}: removed {len(res.get('removed', []))} track(s)")
     return _j(_ue_result(res))
@@ -1067,7 +1077,8 @@ def ue_check(bake_path: str, sequence_path: str, host: str | None = None, start_
              only: list | None = None) -> str:
     """Read the keys back from the Level Sequence and compare them with the bake: per track, expected vs actual key
     counts, missing/extra keys and the largest value error (colour tracks: all four channels; Niagara tracks: also the
-    parameter name)."""
+    parameter name). multiply/add outputs are compared with the offset (or static x gain) recomputed from the target's
+    current base, so a base edited, deactivated or added since the apply fails (apply again)."""
     res = _live(_link(host).check, _bake_file(bake_path), sequence_path, only or None, int(start_frame))
     bad = [t for t in res.get("tracks", []) if not t.get("ok")]
     return _j({"ok": res.get("ok"), "sequence": res.get("sequence"), "tracks": len(res.get("tracks", [])),
@@ -1079,12 +1090,13 @@ def live_push(bake_path: str, sequence_path: str, only_changed: bool = True, sta
               host: str | None = None) -> str:
     """Push a bake into a Level Sequence, rewriting only the outputs whose keys changed since this server's last push
     to that sequence (only_changed=false rewrites all). Outputs pushed before but gone from the bake are removed. If the
-    sequence is open in Sequencer it is re-evaluated, so the viewport shows the change. Returns pushed/skipped/removed
-    output ids and timings (ms)."""
+    sequence is open in Sequencer it is re-evaluated, so the viewport shows the change. A multiply/add output whose base
+    section was edited in the editor counts as changed ("base_edited"). Returns pushed/skipped/removed output ids and
+    timings (ms)."""
     res = _live(_link(host).push, _bake_file(bake_path), sequence_path, bool(only_changed), int(start_frame))
     _notify("live_push", f"{sequence_path}: pushed {res.get('pushed')}, skipped {len(res.get('skipped', []))}")
-    return _j(_ue_result(res, keep=("ok", "pushed", "skipped", "removed", "errors", "keys", "refreshed", "calls", "ms",
-                                    "rt_ms", "editor_ms", "write_ms")))
+    return _j(_ue_result(res, keep=("ok", "pushed", "skipped", "removed", "base_edited", "errors", "keys", "refreshed",
+                                    "calls", "ms", "rt_ms", "editor_ms", "write_ms")))
 
 
 @tool

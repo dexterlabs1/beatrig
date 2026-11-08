@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "beatrig"
-version = "0.2.0"
+version = "0.3.0"
 description = "A reactive engine for agents and artists: music in, deterministic animation keys out."
 readme = "README.md"
 license = "MIT"

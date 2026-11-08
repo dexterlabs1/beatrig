@@ -159,7 +159,7 @@ def op_probability(node, ins, ctx):
     for c in range(s.channels):
         idx = np.flatnonzero(s.v[c] != 0)
         if len(idx):
-            keep[c, idx[unit_random(key, c, idx) < p]] = True
+            keep[c, idx[unit_random(key, c, idx + ctx.start) < p]] = True      # keyed by sequence frame
     return _mask(s, keep)
 
 

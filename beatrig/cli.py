@@ -78,6 +78,9 @@ def cmd_notes_init(a):
     an = analyze(rig)
     ctx = make_ctx(rig, an, notes)
     src, _, nid = (a.source or "").partition(":")
+    if a.min_conf is not None and src != "beats":
+        print("--min-conf applies to --from beats", file=sys.stderr)
+        return 2
     if src == "onsets":
         node = rig.node(nid)
         if node is None or node.get("op") != "onsets":
@@ -89,6 +92,11 @@ def cmd_notes_init(a):
         if node is None or node.get("op") != "beats":
             print(f"--from beats:<node> needs a beats node id, got {nid!r}", file=sys.stderr)
             return 2
+        if a.min_conf is not None:
+            if not 0 <= a.min_conf <= 1:
+                print("--min-conf must be within 0..1", file=sys.stderr)
+                return 2
+            node = dict(node, min_confidence=a.min_conf)
         times, vels = beat_times(node, ctx)
     else:
         print("--from must be onsets:<node> or beats[:<node>]", file=sys.stderr)
@@ -285,9 +293,14 @@ def cmd_stems(a):
 
 def cmd_timeline(a):
     from .timeline import import_timeline
-    res = import_timeline(a.file, a.audio, a.out, fps=a.fps, start_tc=a.start_tc, track=a.track)
+    res = import_timeline(a.file, a.audio, a.out, fps=a.fps, start_tc=a.start_tc, track=a.track, handles=a.handles,
+                          source_start_tc=a.source_start_tc)
+    print(f"{'#':>3} {'mix in':>10} {'mix out':>10} {'src in':>7}  clip")
     for c in res["clips"]:
-        print(f"{c['index']:3} {c['audio_in_s']:10.3f} {c['audio_out_s']:10.3f}  {c['name']}  -> {c['rig']}")
+        tr = "".join(f"  {side} {t['name']} {t['frames']}f" for side, t in (("in:", c["transition_in"]), ("out:", c["transition_out"])) if t)
+        print(f"{c['index']:3} {c['audio_in_s']:10.3f} {c['audio_out_s']:10.3f} {c['audio_offset_frames']:>7}  {c['name']}{tr}  -> {c['rig']}")
+    for w in res["warnings"]:
+        print(f"warning   {w}")
     print(f"{len(res['clips'])} clip rig(s) -> {res['index']}")
     return 0
 
@@ -317,6 +330,8 @@ def main(argv=None):
     p.add_argument("rig")
     p.add_argument("--track")
     p.add_argument("--from", dest="source", help="onsets:<node> | beats[:<node>]")
+    p.add_argument("--min-conf", type=float, default=None,
+                   help="beats: keep only beats whose analysis confidence is at least this (0..1)")
     p.set_defaults(fn=cmd_notes_init)
     p = ns.add_parser("snap", help="quantise a track's hits to a grid")
     p.add_argument("rig")
@@ -373,13 +388,18 @@ def main(argv=None):
     p.set_defaults(fn=cmd_stems)
     pt = sub.add_parser("timeline", help="timeline import: one stub rig per clip of an FCPXML or EDL")
     ts = pt.add_subparsers(dest="action", required=True)
-    p = ts.add_parser("import", help="the show mix must line up with the timeline: audio_in_s = the clip's timeline position")
+    p = ts.add_parser("import", help="the show mix must line up with the timeline: audio_in_s = the clip's timeline position, "
+                                     "audio_offset_frames = its source in-point")
     p.add_argument("file", help=".fcpxml or .edl")
     p.add_argument("--audio", required=True, help="the full mix, starting at the timeline's start")
     p.add_argument("--out", required=True, help="folder for the clip rigs (shares one analysis cache)")
     p.add_argument("--fps", type=float, default=None, help="rig fps (FCPXML: from the sequence format; EDL: default 30)")
     p.add_argument("--start-tc", default=None, help="EDL: timecode of the mix's first sample (default: the hour of the first event)")
     p.add_argument("--track", default="V", help="EDL: track letter to read (default V)")
+    p.add_argument("--handles", type=int, default=0,
+                   help="frames baked before each clip's in point and after its out point, for dissolves (default 0)")
+    p.add_argument("--source-start-tc", default=None,
+                   help="EDL: timecode of the source media's first frame (default 00:00:00:00)")
     p.set_defaults(fn=cmd_timeline)
     p = sub.add_parser("serve", help="local preview page")
     p.add_argument("rig")

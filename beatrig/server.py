@@ -206,8 +206,10 @@ class Engine:
         try:
             cfg, _ = s.settings(rig.data)
             fps = float(result.get("fps", 30))
-            # report windows count seconds from frame 0; audio time = that - offset / fps + audio_in_s
-            off = float(result.get("audio_offset_frames", 0)) / fps - float(rig.data.get("audio_in_s") or 0.0)
+            # report windows count seconds from the first baked frame (bake.start_frame, v0.3);
+            # audio time = that + (start_frame - offset) / fps + audio_in_s
+            off = (float(result.get("audio_offset_frames", 0)) - float(result.get("start_frame", 0))) / fps \
+                - float(rig.data.get("audio_in_s") or 0.0)
             by_id = {o.get("id"): o for o in rig.data.get("outputs", [])}
             out = {}
             for o in result.get("outputs", []):
@@ -637,7 +639,8 @@ class State:
         hdr = {"kind": kind, "id": cid, "bake_id": self.bake_id, "lod": lod, "bucket": bucket, "layout": layout,
                "channels": int(a.shape[0]), "frames": int(a.shape[1]), "count": int(data.shape[1]),
                "components": 4 if a.ndim == 3 else 1, "hash": self.hashes.get(cid if kind == "output" else "band:" + cid),
-               "fps": (self.bake or {}).get("fps"), "audio_offset_frames": (self.bake or {}).get("audio_offset_frames", 0)}
+               "fps": (self.bake or {}).get("fps"), "audio_offset_frames": (self.bake or {}).get("audio_offset_frames", 0),
+               "start_frame": (self.bake or {}).get("start_frame", 0)}
         blob = binary(hdr, np.ascontiguousarray(data, "<f4").tobytes())
         self.cache[key] = blob
         return blob

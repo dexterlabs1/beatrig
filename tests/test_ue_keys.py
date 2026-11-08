@@ -1,5 +1,6 @@
 """ue/keys.py: the pure half of the Unreal applier (tick maths, key planning, tags, read-back compare)."""
 import json
+import math
 import os
 import sys
 from fractions import Fraction
@@ -251,3 +252,179 @@ def test_engine_colour_and_transform_bakes_plan():
     assert plans["beatrig:tint"]["value_type"] == "color" and len(plans["beatrig:tint"]["keys"][0][1]) == 4
     assert plans["beatrig:lc:L0"]["track"] == "MovieSceneColorTrack"
     assert plans["beatrig:yaw:D0"]["channel_name"] == "Rotation.Z" and plans["beatrig:yaw:D0"]["blend"] == "additive"
+
+
+# ---------------------------------------------------------------- v0.3: output blend (multiply / add onto a base)
+def test_rdp_matches_the_engine():
+    """K.rdp (pure Python, runs in the editor) keeps exactly the frames beatrig.bake.rdp (numpy) keeps"""
+    np = pytest.importorskip("numpy")
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from beatrig.bake import rdp as engine_rdp
+    rng = np.random.default_rng(7)
+    for trial in range(30):
+        n = int(rng.integers(2, 400))
+        v = np.cumsum(rng.normal(0, 1, n)) * float(rng.uniform(0.1, 10))
+        v[rng.integers(0, n, 3)] += 20                                  # a few spikes (hits)
+        forced = sorted(set(rng.integers(0, n, 4).tolist()))
+        tol = float(rng.uniform(0.01, 2.0))
+        assert K.rdp(v.tolist(), tol, forced) == engine_rdp(v, tol, forced).tolist(), trial
+        c = rng.uniform(0, 1, (n, 4))
+        assert K.rdp([tuple(r) for r in c.tolist()], 0.2, forced) == engine_rdp(c, 0.2, forced).tolist(), trial
+    assert K.rdp([], 0.1) == [] and K.rdp([1.0], 0.1) == [0] and K.rdp([1.0, 2.0], 0.1) == [0, 1]
+
+
+def test_sample_keys_and_combine():
+    keys = [(10, 1.0), (20, 3.0), (30, 1.0)]
+    s = K.sample_keys(keys, range(8, 33), 7.0)
+    assert s[:2] == [7.0, 7.0] and s[-2:] == [7.0, 7.0]                 # neutral outside the keys
+    assert s[2] == 1.0 and s[7] == 2.0 and s[12] == 3.0 and s[22] == 1.0   # exact at keys, linear between
+    c = K.sample_keys([(0, (0.0, 1.0, 2.0, 1.0)), (4, (4.0, 1.0, 0.0, 1.0))], range(0, 6), (1.0,) * 4)
+    assert c[2] == (2.0, 1.0, 1.0, 1.0) and c[5] == (1.0, 1.0, 1.0, 1.0)
+    assert K.combine(2.0, 1.5, "multiply") == 3.0 and K.combine(2.0, 1.5, "add") == 3.5
+    assert K.combine((1.0, 2.0, 3.0, 1.0), (2.0, 0.5, 1.0, 1.0), "multiply") == (2.0, 1.0, 3.0, 1.0)
+    assert K.combine((1.0, 2.0, 3.0, 1.0), (0.1, 0.0, -1.0, 0.0), "add") == (1.1, 2.0, 2.0, 1.0)
+    with pytest.raises(K.PlanError):
+        K.combine(1.0, 1.0, "replace")
+
+
+def test_blend_frame_keys_multiply_over_a_moving_base():
+    base = [100.0 + 50.0 * math.sin(f / 9.0) for f in range(0, 121)]          # the show's own curve, frames 0..120
+    gains = [(30, 1.0), (40, 1.5), (41, 0.6), (60, 1.2), (90, 1.0)]          # bake range 30..90, a hit at 40
+    fk = K.blend_frame_keys(gains, "multiply", 0, base, tol_rel=0.002)
+    assert fk[0][0] == 0 and fk[-1][0] == 120                                # the whole base span is covered
+    frames = range(0, 121)
+    want = [b * g for b, g in zip(base, K.sample_keys(gains, frames, 1.0))]
+    got = K.sample_keys(fk, frames, None)
+    tol = 0.002 * (max(want) - min(want))
+    assert max(abs(a - b) for a, b in zip(want, got)) <= tol + 1e-9        # linear keys within the RDP tolerance
+    kept = dict(fk)
+    assert {30, 40, 41, 60, 90, 29, 91} <= set(kept)                         # gain keys + the frames just outside
+    assert kept[40] == pytest.approx(base[40] * 1.5) and kept[29] == pytest.approx(base[29])
+    assert all(v == pytest.approx(base[f]) for f, v in kept.items() if f < 30 or f > 90)   # outside: final = base
+
+
+def test_blend_frame_keys_add_static_and_colour():
+    fk = K.blend_frame_keys([(5, 0.0), (10, 2.0), (15, 0.0)], "add", 5, [3.0] * 11)
+    assert fk == [(5, 3.0), (10, 5.0), (15, 3.0)]                            # constant base + offsets = shifted keys
+    base = [(1.0, 0.5, 0.2, 1.0)] * 5
+    fk = K.blend_frame_keys([(0, (2.0, 1.0, 0.5, 1.0)), (4, (1.0, 1.0, 1.0, 1.0))], "multiply", 0, base)
+    assert fk[0] == (0, (2.0, 0.5, 0.1, 1.0)) and fk[-1] == (4, (1.0, 0.5, 0.2, 1.0)) and len(fk) == 2
+    assert K.blend_frame_keys([(0, 1.0)], "multiply", 0, []) == []
+
+
+def test_offset_value():
+    assert K.offset_value(200.0, 1.5, "multiply") == 100.0 and K.offset_value(200.0, 1.0, "multiply") == 0.0
+    assert K.offset_value(200.0, 25.0, "add") == 25.0
+    assert K.offset_value((1.0, 0.5, 0.0, 1.0), (2.0, 1.0, 3.0, 1.0), "multiply") == (1.0, 0.0, 0.0, 0.0)
+    with pytest.raises(K.PlanError):
+        K.offset_value(1.0, 1.0, "replace")
+
+
+def test_offset_frame_keys_over_a_moving_base():
+    """the additive section: base x (gain - 1), 0 one frame each side of the bake range, base + offset within the RDP
+    tolerance of base x gain at every frame"""
+    gains = [(30, 1.0), (40, 1.5), (41, 0.6), (60, 1.2), (90, 1.0)]          # bake range 30..90, a hit at 40
+    base = [100.0 + 50.0 * math.sin(f / 9.0) for f in range(29, 92)]         # the show's curve on frames 29..91
+    fk = K.offset_frame_keys(gains, "multiply", 29, base, tol_rel=0.002)
+    keys = dict(fk)
+    assert fk[0] == (29, 0.0) and fk[-1] == (91, 0.0)                        # back to nothing outside the range
+    assert {30, 40, 41, 60, 90} <= set(keys)                                 # every gain key (hits included)
+    assert keys[40] == pytest.approx(base[40 - 29] * 0.5) and keys[30] == 0.0
+    frames = range(29, 92)
+    want = [b * g for b, g in zip(base, K.sample_keys(gains, frames, 1.0))]
+    got = [b + o for b, o in zip(base, K.sample_keys(fk, frames, None))]
+    assert max(abs(a - b) for a, b in zip(want, got)) <= 0.002 * (max(want) - min(want)) + 1e-9
+    add = K.offset_frame_keys([(5, 0.0), (10, 2.0), (15, 0.5)], "add", 4, [0.0] * 13)
+    assert add == [(4, 0.0), (5, 0.0), (10, 2.0), (15, 0.5), (16, 0.0)]      # add: the offset keys themselves
+    col = K.offset_frame_keys([(1, (2.0, 1.0, 1.0, 1.0)), (2, (2.0, 1.0, 1.0, 1.0))], "multiply", 0,
+                              [(0.5, 0.5, 0.5, 1.0)] * 4)
+    assert col[0] == (0, (0.0, 0.0, 0.0, 0.0)) and col[1] == (1, (0.5, 0.0, 0.0, 0.0)) and col[-1][0] == 3
+    assert K.offset_frame_keys(gains, "multiply", 0, []) == []
+
+
+def test_target_key_tells_targets_apart():
+    def pl(target, actor=None):
+        return K.plan_output({"id": "o", "blend": "multiply", "target": target,
+                              "channels": [{"actor": actor, "keys": [[0, 1.0]]}]}, 30, 30, 24000)[0]
+    glow = pl({"kind": "mpc", "asset": "/Game/FX/M", "param": "Glow"})
+    assert K.target_key(glow) == K.target_key(dict(glow, output="other", tag="beatrig:other"))
+    assert K.target_key(glow) != K.target_key(pl({"kind": "mpc", "asset": "/Game/FX/M", "param": "Tint"}))
+    assert K.target_key(pl({"kind": "light", "property": "intensity"}, "L0")) !=         K.target_key(pl({"kind": "light", "property": "intensity"}, "L1"))
+
+
+def test_plan_blend_fields():
+    out = {"id": "g", "blend": "multiply", "target": {"kind": "mpc", "asset": "/Game/FX/M", "param": "Glow"},
+           "channels": [{"keys": [[0, 0.6], [10, 1.5]]}]}
+    p = K.plan_output(out, 30, 30, 24000, start_frame=100)[0]
+    assert p["output_blend"] == "multiply" and p["src_keys"] == [(100, 0.6), (110, 1.5)]
+    assert p["keys"] == [(80000, 0.6), (88000, 1.5)]                         # still planned in ticks
+    assert "src_keys" not in K.plan_output(dict(out, blend=None), 30, 30, 24000)[0]
+    assert K.plan_output(dict(out, blend="replace"), 30, 30, 24000)[0]["output_blend"] == "replace"
+    with pytest.raises(K.PlanError, match="blend 'screen'"):
+        K.plan_output(dict(out, blend="screen"), 30, 30, 24000)
+    with pytest.raises(K.PlanError, match="use target.additive for transforms"):
+        K.plan_output({"id": "t", "blend": "add", "target": {"kind": "transform", "actors": ["A0"],
+                                                              "property": "location", "axis": "z"},
+                       "channels": [{"actor": "A0", "keys": [[0, 0.0], [10, 5.0]]}]}, 30, 30, 24000)
+    col = K.plan_output(dict(_out("t", {"kind": "mpc", "asset": "/x", "param": "Tint", "value_type": "color"},
+                                  COLOR_KEYS, None), blend="multiply"), 30, 30, 24000)[0]
+    assert col["src_keys"][1] == (10, (0.0, 0.25, 1.0, 1.0))
+
+
+def test_blended_plan_converts_to_the_plan_time_base():
+    p = K.plan_output({"id": "g", "blend": "add", "target": {"kind": "mpc", "asset": "/x", "param": "Glow"},
+                       "channels": [{"keys": [[0, 0.0], [10, 1.0]]}]}, 30, 30, 24000)[0]
+    f = K.blended_plan(p, [(-1, 0.0), (0, 2.0), (10, 3.0), (11, 0.0)], [-1, 12], "additive", 24000, 30)
+    assert f["keys"] == [(-800, 0.0), (0, 2.0), (8000, 3.0), (8800, 0.0)] and f["range"] == [-1, 12]
+    assert f["blend"] == "additive" and p["blend"] == "absolute"
+    assert K.blended_plan(p, [(0, 1.0)], [0, 1], "absolute")["blend"] == "absolute"
+    with pytest.raises(K.PlanError):
+        K.blended_plan(p, [(0, 1.0)], [0, 1], "override")
+    assert K.frame_keys(f, 800) == [(-1.0, 0.0), (0.0, 2.0), (10.0, 3.0), (11.0, 0.0)]
+    assert p["keys"] == [(0, 0.0), (8000, 1.0)]                              # the plan itself is untouched
+    with pytest.raises(K.PlanError):
+        K.frames_to_time_base([(0, 1.0)], "seconds")
+
+
+def test_base_records_and_helpers():
+    key = K.base_meta_key("beatrig:lamp:Light_0")
+    assert key == "beatrig.base:beatrig:lamp:Light_0" and K.base_meta_tag(key) == "beatrig:lamp:Light_0"
+    assert K.base_meta_tag("other") is None
+    rec = {"v": 1, "kind": "section", "section": "MovieScene_0.T_1.S_0", "static": None, "fp": "ab"}
+    assert K.decode_record(K.encode_record(rec)) == rec
+    assert K.decode_record("not json") is None and K.decode_record("[1]") is None
+    seq = "/Game/Show/LS_Main.LS_Main"
+    assert K.relative_path(seq + ":MovieScene_0.Track_2.Section_0", seq) == "MovieScene_0.Track_2.Section_0"
+    assert K.relative_path("/Game/Other.Other:MovieScene_0", seq) is None
+    fp = K.fingerprint([[0, 1.0, "CUBIC"]])
+    assert fp == K.fingerprint([[0, 1.0, "CUBIC"]]) and fp != K.fingerprint([[0, 1.1, "CUBIC"]])
+    assert K.srgb8_to_linear((255, 0, 128, 255)) == pytest.approx((1.0, 0.0, 0.2158605, 1.0), abs=1e-6)
+    assert K.editor_property_name("AttenuationRadius") == "attenuation_radius"
+    assert K.editor_property_name("Intensity") == "intensity" and K.editor_property_name("LightColor") == "light_color"
+
+
+def test_blend_fixtures_plan():
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+    for name, mode in (("bake_blend_multiply.json", "multiply"), ("bake_blend_add.json", "add")):
+        with open(os.path.join(here, name), encoding="utf-8") as fh:
+            plans = K.plan_bake(json.load(fh), 30, 24000)
+        assert {p["output_blend"] for p in plans} == {mode}
+        assert {(p["kind"], p["value_type"]) for p in plans} == {("mpc", "float"), ("mpc", "color"), ("light", "float")}
+
+
+def test_bake_start_frame_shifts_every_key():
+    """bake.json "start_frame": key frame f lands on sequence frame start_frame + f (plus the applier's --start)"""
+    b = json.loads(json.dumps(BAKE))
+    base = K.plan_bake(b, 30, 24000)
+    b["start_frame"] = 300
+    shifted = K.plan_bake(b, 30, 24000)
+    assert shifted[1]["keys"][0] == (300, 500.0) and shifted[1]["range"] == [300, 400]
+    assert shifted[0]["keys"][1] == (K.frame_to_ticks(310), 1.0)                 # MPC ticks move too
+    assert K.plan_bake(b, 30, 24000, start_frame=10)[1]["keys"][0] == (310, 500.0)
+    b["start_frame"] = 0
+    assert K.plan_bake(b, 30, 24000) == base                                      # 0 = unchanged
+    b["outputs"][0]["blend"] = "multiply"
+    b["start_frame"] = 300
+    assert K.plan_bake(b, 30, 24000, only=["glow"])[0]["src_keys"][0] == (300, 0.2)
+    with pytest.raises(K.PlanError, match="whole frame"):
+        K.bake_start({"start_frame": "soon"})

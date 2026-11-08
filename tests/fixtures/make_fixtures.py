@@ -40,10 +40,18 @@ def hue(phase=0.0):
     return fn
 
 
-def output(oid, target, chans, lo=None, hi=None):
+def _gain_color(fn, lo, hi, alpha):
+    """per-frame RGBA gains/offsets: RGB lo..hi from fn(t) (each channel phase-shifted), alpha fixed"""
+    vals = [[round(lo + (hi - lo) * fn(f / FPS + k * 0.1), 6) for k in range(3)] + [alpha] for f in range(FRAMES)]
+    return {"values": vals, "keys": [[f] + vals[f] for f in _key_frames()]}
+
+
+def output(oid, target, chans, lo=None, hi=None, blend=None):
     o = {"id": oid, "target": target, "channels": chans}
     if lo is not None:
         o["min"], o["max"] = lo, hi
+    if blend:
+        o["blend"] = blend
     return o
 
 
@@ -86,6 +94,23 @@ FIXTURES = {
     "bake_niagara.json": bake([
         output("rate", {"kind": "niagara", "actors": ["Fx_0"], "param": "Rate"},
                [ch("Fx_0", _scalar(pulse(0.0), 10, 200))], 10, 200),
+    ]),
+    # v0.3 output blend: gains (multiply) / offsets (add) on the targets' own animation in the sequence
+    "bake_blend_multiply.json": bake([
+        output("glow_gain", {"kind": "mpc", "asset": "/Game/FX/MPC_Show", "param": "Glow"},
+               [dict({"actor": None}, **_scalar(pulse(0.0), 0.6, 1.55))], 0.6, 1.55, blend="multiply"),
+        output("tint_gain", {"kind": "mpc", "asset": "/Game/FX/MPC_Show", "param": "Tint", "value_type": "color"},
+               [dict({"actor": None}, **_gain_color(pulse(0.3), 0.6, 1.55, 1.0))], blend="multiply"),
+        output("lamp_gain", {"kind": "light", "actors": ["Light_0"], "property": "intensity"},
+               [ch("Light_0", _scalar(pulse(0.6), 0.6, 1.55))], 0.6, 1.55, blend="multiply"),
+    ]),
+    "bake_blend_add.json": bake([
+        output("glow_add", {"kind": "mpc", "asset": "/Game/FX/MPC_Show", "param": "Glow"},
+               [dict({"actor": None}, **_scalar(pulse(0.0), -0.5, 0.5))], -0.5, 0.5, blend="add"),
+        output("tint_add", {"kind": "mpc", "asset": "/Game/FX/MPC_Show", "param": "Tint", "value_type": "color"},
+               [dict({"actor": None}, **_gain_color(pulse(0.3), 0.0, 0.3, 0.0))], blend="add"),
+        output("lamp_add", {"kind": "light", "actors": ["Light_0"], "property": "intensity"},
+               [ch("Light_0", _scalar(pulse(0.6), -500, 1500))], -500, 1500, blend="add"),
     ]),
 }
 

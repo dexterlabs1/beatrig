@@ -25,6 +25,16 @@ Every key is linear, so curves can't overshoot. Every track is named "beatrig:<o
 exactly those tracks and nothing else. Bindings the applier creates carry the binding tag "beatrig"; once their tracks
 are gone they are removed too, and bindings it found already in the sequence are never removed. `apply` first removes
 the tracks it is about to replace, so it is idempotent. Each call is one editor transaction (Ctrl+Z undoes it).
+
+Output blend (v0.3, output "blend": "multiply" | "add"; the bake's values are gains or offsets). The base is the first
+active non-beatrig section that drives the same target; it is only read, never changed, so a section shared with other
+parameters is fine. Over it the beatrig track is an ADDITIVE section (blend type set before any key) holding the offset:
+base x (gain - 1) for multiply, from the base evaluated at every frame, or the offsets for add, with 0 one frame each
+side of the bake range so the base plays alone outside it. With no base section, the track is an ABSOLUTE section of
+static x gain (static + offset) over the bake range, the static value (MPC default, property value) read at the first
+apply. What each track was applied over is recorded in the sequence asset's metadata ("beatrig.base:<track tag>"):
+`check` recomputes from the current base, `push` rewrites outputs whose base was edited, `undo` deletes the track and
+the record. One beatrig blend per target.
 """
 import importlib.util
 import json
@@ -270,9 +280,32 @@ def _add_param_keys(section, plan):
 
 
 def _new_section(track, rng):
+    """a section over rng = [start, end) display frames; a None end is left unbounded (a blended track mirrors an
+    infinite base section, so the parameter keeps the base's value outside the keys instead of dropping to default)"""
     s = track.add_section()
-    s.set_range(int(rng[0]), int(rng[1]))
+    lo, hi = rng
+    if lo is not None and hi is not None:
+        s.set_range(int(lo), int(hi))
+        return s
+    if lo is None:
+        s.set_start_frame_bounded(False)
+    else:
+        s.set_start_frame(int(lo))
+    if hi is None:
+        s.set_end_frame_bounded(False)
+    else:
+        s.set_end_frame(int(hi))
     return s
+
+
+def _section(track, plan):
+    """the plan's section, its blend type set BEFORE any key: set afterwards, the stored type changes but Sequencer
+    keeps evaluating the section the old way (seen on 5.8.3: an additive MPC section set after its keys still averaged)"""
+    sec = _new_section(track, plan["range"])
+    if plan["kind"] == "transform" or plan.get("blend") == "additive":
+        sec.set_blend_type(unreal.MovieSceneBlendType.ADDITIVE if plan["blend"] == "additive"
+                           else unreal.MovieSceneBlendType.ABSOLUTE)
+    return sec
 
 
 def _channels_by_name(section):
@@ -352,7 +385,7 @@ def _write(seq, plan, ctx):
         track = seq.add_track(unreal.MovieSceneMaterialParameterCollectionTrack)
         track.set_editor_property("mpc", _mpc(plan["asset"]))
         _set_name(track, plan["tag"])
-        sec = _new_section(track, plan["range"])
+        sec = _section(track, plan)
         _add_param_keys(sec, plan)
         _linearise(sec)
         return track
@@ -363,7 +396,7 @@ def _write(seq, plan, ctx):
         track = b.add_track(unreal.MovieSceneColorTrack if color else unreal.MovieSceneFloatTrack)
         track.set_property_name_and_path(plan["property"], plan["property"])
         _set_name(track, plan["tag"])
-        sec = _new_section(track, plan["range"])
+        sec = _section(track, plan)
         chans = list(sec.get_all_channels())
         if color:
             for ch, comp_keys in zip(chans, K.split_components(plan["keys"])):
@@ -384,7 +417,7 @@ def _write(seq, plan, ctx):
         else:                                                               # older engines
             track.set_material_index(idx)
         _set_name(track, plan["tag"])
-        sec = _new_section(track, plan["range"])
+        sec = _section(track, plan)
         _add_param_keys(sec, plan)
         _linearise(sec)
         return track
@@ -393,20 +426,339 @@ def _write(seq, plan, ctx):
         b = _component_binding(seq, actor, comp, ctx)
         track = _niagara_float_track(seq, b, plan["param"])
         _set_name(track, plan["tag"])
-        sec = _new_section(track, plan["range"])
+        sec = _section(track, plan)
         _add_frame_keys(sec.get_all_channels()[0], plan["keys"])
         return track
     if kind == "transform":
         b = _actor_binding(seq, actor, ctx)
         track = b.add_track(unreal.MovieScene3DTransformTrack)
         _set_name(track, plan["tag"])
-        sec = _new_section(track, plan["range"])
-        sec.set_blend_type(unreal.MovieSceneBlendType.ADDITIVE if plan["blend"] == "additive"
-                           else unreal.MovieSceneBlendType.ABSOLUTE)
+        sec = _section(track, plan)
         ch = _channels_by_name(sec).get(plan["channel_name"]) or sec.get_all_channels()[plan["channel_index"]]
         _add_frame_keys(ch, plan["keys"])
         return track
     raise RuntimeError(f"unknown kind {kind}")
+
+
+# ------------------------------------------------------------------ output blend: the base, its evaluation, records
+def _records(seq):
+    """{track tag: record} for every base a multiply/add output was applied over (asset metadata, saved with it)"""
+    out = {}
+    try:
+        tags = dict(unreal.EditorAssetLibrary.get_metadata_tag_values(seq))
+    except Exception:
+        return out
+    for k, v in tags.items():
+        t = K.base_meta_tag(str(k))
+        rec = K.decode_record(str(v)) if t else None
+        if rec:
+            out[t] = rec
+    return out
+
+
+def _save_record(seq, tag, rec):
+    unreal.EditorAssetLibrary.set_metadata_tag(seq, K.base_meta_key(tag), K.encode_record(rec))
+
+
+def _drop_record(seq, tag):
+    unreal.EditorAssetLibrary.remove_metadata_tag(seq, K.base_meta_key(tag))
+
+
+def _resolve_section(seq, rel):
+    """a recorded section, if it still sits in a track of this sequence (a deleted track's section can linger in
+    memory, so it is looked up through the sequence's tracks rather than trusted by path)"""
+    if not rel:
+        return None
+    sec = unreal.find_object(None, seq.get_path_name() + ":" + rel)
+    if sec is None:
+        return None
+    track = sec.get_outer()
+    for t, _ in _all_tracks(seq):
+        if t == track:
+            return sec if any(s == sec for s in t.get_sections()) else None
+    return None
+
+
+def _find_binding(seq, actor, component=None):
+    """the actor's (or its component's) existing binding, matched the way the writers match; never creates one"""
+    label = actor.get_actor_label()
+    for b in seq.get_bindings():
+        if str(b.get_name()) == label and not (hasattr(b, "get_parent") and b.get_parent().is_valid()):
+            if component is None:
+                return b
+            for c in b.get_child_possessables():
+                if str(c.get_name()) == component.get_name():
+                    return c
+            return None
+    return None
+
+
+def _material_slot(track):
+    if hasattr(track, "get_material_info"):
+        return int(track.get_material_info().get_editor_property("material_slot_index"))
+    return int(track.get_material_index())
+
+
+def _param_names(sec):
+    try:
+        return [str(n) for n in sec.get_parameter_names()]
+    except Exception:
+        return [str(c.channel_name) for c in sec.get_all_channels()]
+
+
+_COMPONENTS = {"light": (unreal.LightComponentBase, "light"), "material": (unreal.PrimitiveComponent, "primitive (mesh)"),
+               "niagara": (unreal.NiagaraComponent, "Niagara")}
+
+
+def _base_candidates(seq, plan):
+    """(track, section) pairs not written by beatrig that drive the plan's target, in sequence order"""
+    kind = plan["kind"]
+    out = []
+    if kind == "mpc":
+        want = _pkg(_mpc(plan["asset"]))
+        for t in _seq_tracks(seq):
+            if not isinstance(t, unreal.MovieSceneMaterialParameterCollectionTrack) or K.is_ours(_track_name(t)):
+                continue
+            m = t.get_editor_property("mpc")
+            if m is not None and _pkg(m) == want:
+                out += [(t, s) for s in t.get_sections() if plan["param"] in _param_names(s)]
+        return out
+    actor = _find_actor(plan["actor"])
+    if kind == "transform":
+        b = _find_binding(seq, actor)
+        tracks = [t for t in b.get_tracks() if isinstance(t, unreal.MovieScene3DTransformTrack)] if b else []
+    else:
+        comp = _component(actor, *_COMPONENTS[kind])
+        b = _find_binding(seq, actor, comp)
+        tracks = list(b.get_tracks()) if b else []
+        if kind == "light":
+            cls = unreal.MovieSceneColorTrack if plan["value_type"] == "color" else unreal.MovieSceneFloatTrack
+            tracks = [t for t in tracks if type(t) is cls and str(t.get_property_name()) == plan["property"]]
+        elif kind == "material":
+            tracks = [t for t in tracks if isinstance(t, unreal.MovieSceneComponentMaterialTrack)
+                      and _material_slot(t) == plan["material_index"]]
+        else:
+            tracks = [t for t in tracks if isinstance(t, unreal.MovieSceneNiagaraFloatParameterTrack)
+                      and not K.is_ours(_track_name(t)) and _niagara_track_param(t) == plan["param"]]
+    for t in tracks:
+        if K.is_ours(_track_name(t)):
+            continue
+        for s in t.get_sections():
+            if kind != "material" or plan["param"] in _param_names(s):
+                out.append((t, s))
+    return out
+
+
+def _target_channels(sec, plan):
+    """the section's channels for the plan's target, in key order (None when it lacks one)"""
+    names = K.channel_names(plan)
+    chans = list(sec.get_all_channels())
+    if names is None:
+        return chans[:1] or None
+    by = {str(c.channel_name): c for c in chans}
+    sel = [by.get(n) for n in names]
+    return sel if all(c is not None for c in sel) else None
+
+
+def _bounds(sec):
+    """(start, end) display frames, end exclusive; None for an unbounded side"""
+    return (sec.get_start_frame() if sec.has_start_frame() else None,
+            sec.get_end_frame() if sec.has_end_frame() else None)
+
+
+def _key_time(k):
+    ft = k.get_time()
+    return ft.frame_number.value + ft.sub_frame
+
+
+def _evaluate(seq, chans, lo, hi):
+    """the channels' values at display frames lo..hi (inclusive), one per frame; tuples for several channels.
+    GOTCHA: SequencerScriptingRange() defaults to an internal rate of 60000/s, so the range is built with the
+    sequence's display rate spelled out (evaluate_keys then samples once per display frame)."""
+    fr = seq.get_display_rate()
+    r = unreal.SequencerScriptingRange()
+    r.import_text(f"(bHasStart=True,bHasEnd=True,InclusiveStart={int(lo)},ExclusiveEnd={int(hi) + 1},"
+                  f"InternalRate=(Numerator={fr.numerator},Denominator={fr.denominator}))")
+    cols = [list(c.evaluate_keys(r, fr)) for c in chans]
+    n = int(hi) - int(lo) + 1
+    if any(len(col) != n for col in cols):
+        raise RuntimeError(f"evaluate_keys returned {[len(col) for col in cols]} values for {n} frames")
+    return cols[0] if len(cols) == 1 else [tuple(v) for v in zip(*cols)]
+
+
+def _base_fp(sec, chans):
+    """fingerprint of what the base plays (keys, tangents, extrapolation, default, section bounds), not its active
+    state; a live push compares it to tell that the base was edited"""
+    rows = [list(_bounds(sec))]
+    for c in chans:
+        keys = []
+        for k in c.get_keys():
+            keys.append([_key_time(k), k.get_value()] + [str(getattr(k, g)()) for g in
+                        ("get_interpolation_mode", "get_tangent_mode", "get_arrive_tangent", "get_leave_tangent")
+                        if hasattr(k, g)])
+        rows.append([str(c.channel_name), str(c.get_pre_infinity_extrapolation()),
+                     str(c.get_post_infinity_extrapolation()), c.get_default() if c.has_default() else None, keys])
+    return K.fingerprint(rows)
+
+
+def _static_value(plan):
+    """the target's own value with no section driving it: the MPC default, the light or material property, the
+    Niagara user parameter, the actor's transform channel. Read once, at the first apply, and recorded."""
+    kind, color = plan["kind"], plan["value_type"] == "color"
+    if kind == "mpc":
+        m = _mpc(plan["asset"])
+        v, found = (m.get_vector_parameter_default_value(plan["param"]) if color
+                    else m.get_scalar_parameter_default_value(plan["param"]))
+        if not found:
+            raise RuntimeError(f"{plan['asset']} has no {'vector' if color else 'scalar'} parameter {plan['param']!r}")
+        return (v.r, v.g, v.b, v.a) if color else float(v)
+    actor = _find_actor(plan["actor"])
+    if kind == "light":
+        v = _component(actor, *_COMPONENTS["light"]).get_editor_property(K.editor_property_name(plan["property"]))
+        return K.srgb8_to_linear((v.r, v.g, v.b, v.a)) if color else float(v)
+    if kind == "material":
+        mat = _component(actor, *_COMPONENTS["material"]).get_material(plan["material_index"])
+        if mat is None:
+            raise RuntimeError(f"{plan['actor']}: no material in slot {plan['material_index']}")
+        lib, p = unreal.MaterialEditingLibrary, plan["param"]
+        if isinstance(mat, unreal.MaterialInstanceConstant):
+            v = (lib.get_material_instance_vector_parameter_value(mat, p) if color
+                 else lib.get_material_instance_scalar_parameter_value(mat, p))
+        else:
+            base = mat.get_base_material()
+            v = (lib.get_material_default_vector_parameter_value(base, p) if color
+                 else lib.get_material_default_scalar_parameter_value(base, p))
+        return (v.r, v.g, v.b, v.a) if color else float(v)
+    if kind == "niagara":
+        comp = _component(actor, *_COMPONENTS["niagara"])
+        for name in (plan["param"][len("User."):], plan["param"]):
+            r = comp.get_variable_float(name)
+            v, ok = r if isinstance(r, tuple) else (r, True)
+            if ok:
+                return float(v)
+        raise RuntimeError(f"{plan['actor']}: Niagara user parameter {plan['param']!r} not readable; key a base track")
+    if kind == "transform":
+        prop, axis = plan["property"].split(".")
+        if prop == "rotation":
+            rot = actor.get_actor_rotation()
+            return float({"x": rot.roll, "y": rot.pitch, "z": rot.yaw}[axis])
+        v = actor.get_actor_location() if prop == "location" else actor.get_actor_scale3d()
+        return float(getattr(v, axis))
+    raise RuntimeError(f"unknown kind {kind}")
+
+
+def _blend_from(seq, plan, sec, static, tol):
+    """the plan, ready to write, for a multiply/add output over a base section (sec) or a static value.
+    Over a section: an unbounded ADDITIVE section holding the offset on frames first - 1 .. last + 1 (multiply:
+    base x (gain - 1), from the base evaluated at every frame; add: the offsets), 0 at both ends, so the base plays alone
+    outside the bake range. Over a static value: an ABSOLUTE section of static x gain (or + offset) on the bake range."""
+    first, last = int(plan["src_keys"][0][0]), int(plan["src_keys"][-1][0])
+    mode = plan["output_blend"]
+    if sec is None:
+        fk = K.blend_frame_keys(plan["src_keys"], mode, first, [static] * (last - first + 1), tol)
+        rng, how = [first, last + 1], "absolute"
+    else:
+        lo, hi = first - 1, last + 1
+        if mode == "multiply":
+            values = _evaluate(seq, _target_channels(sec, plan), lo, hi)
+        else:                                               # an offset doesn't depend on the base
+            width = 4 if plan["value_type"] == "color" else 0
+            values = [(0.0,) * width if width else 0.0] * (hi - lo + 1)
+        fk = K.offset_frame_keys(plan["src_keys"], mode, lo, values, tol)
+        # unbounded: the 0 keys at both ends (constant extrapolation) keep the offset at 0 outside the bake range, and a
+        # section that never ends never hands the target back. GOTCHA (5.8.3): when a bounded beatrig section on a
+        # component material slot ended, Sequencer restored the material's own value at the frames after it, over the
+        # base track on the same slot, until the sequence was next re-evaluated.
+        rng, how = [None, None], "additive"
+    return K.blended_plan(plan, fk, rng, how, _rate(seq.get_tick_resolution()), _rate(seq.get_display_rate()))
+
+
+def _channel_names_of(sec, plan):
+    return [str(c.channel_name) for c in (_target_channels(sec, plan) or [])]
+
+
+def _find_base(seq, plan):
+    """the first active section, on a track beatrig didn't write, that drives the plan's target (None if there is none).
+    Shared sections are fine: the base is only read, never changed."""
+    for _, s in _base_candidates(seq, plan):
+        if s.is_active() and _target_channels(s, plan) is not None:
+            return s
+    return None
+
+
+def _uncovered(sec, plan):
+    """bake frames a bounded base section doesn't cover (the offset there adds onto whatever the target holds)"""
+    s, e = _bounds(sec)
+    first, last = int(plan["src_keys"][0][0]), int(plan["src_keys"][-1][0])
+    if (s is None or s <= first) and (e is None or e > last):
+        return None
+    return [first if s is None else max(first, s), last if e is None else min(last, e - 1)]
+
+
+def _blend(seq, plan, rec, held, tol):
+    """resolve a multiply/add plan's base and compute what to write. rec: this track's record from an earlier apply;
+    held: {target key: tag} of targets other tracks already blend. Returns (plan to write, record, warning or None)."""
+    tkey = K.target_key(plan)
+    if tkey in held:
+        raise RuntimeError(f"{held[tkey]} already blends this target; two additive layers on one parameter would be "
+                           f"ambiguous, so blend one beatrig output per target")
+    mode = plan["output_blend"]
+    sec = _find_base(seq, plan)
+    rec_new = {"v": 1, "output": plan["output"], "mode": mode, "target": tkey}
+    if sec is None:
+        static = rec.get("static") if rec and rec.get("kind") == "static" else None
+        if static is None:
+            static = _static_value(plan)
+        static = tuple(static) if isinstance(static, (list, tuple)) else float(static)
+        rec_new.update({"kind": "static", "track": None, "static": list(static) if isinstance(static, tuple) else static})
+        return _blend_from(seq, plan, None, static, tol), rec_new, None
+    chans = _target_channels(sec, plan)
+    rec_new.update({"kind": "section", "section": K.relative_path(sec.get_path_name(), seq.get_path_name()),
+                    "track": _track_name(sec.get_outer()), "channels": _channel_names_of(sec, plan),
+                    "fp": _base_fp(sec, chans) if mode == "multiply" else None})
+    gap = _uncovered(sec, plan)
+    warn = (f"the base section doesn't cover bake frames {gap[0]}-{gap[1]}; there the offset adds onto the target's "
+            f"current value") if gap else None
+    return _blend_from(seq, plan, sec, None, tol), rec_new, warn
+
+
+def _forget(seq, records, output_id=None, keep=()):
+    """drop the records of every track of output_id (all outputs when None) except the tags in keep. The base was never
+    changed, so there is nothing to give back."""
+    out = []
+    for tag in sorted(records):
+        if K.is_ours(tag, output_id) and tag not in keep:
+            records.pop(tag)
+            _drop_record(seq, tag)
+            out.append(tag)
+    return out
+
+
+def _remove_tag(seq, tag):
+    for t, b in _all_tracks(seq):
+        if _track_name(t) == tag:
+            (b.remove_track(t) if b is not None else _seq_remove_track(seq, t))
+
+
+def _bases_changed(seq, output_ids):
+    """output ids (of those given) whose recorded base section was edited since the apply (multiply: its keys'
+    fingerprint changed), or is gone or inactive (the offset would then add onto nothing)"""
+    out = set()
+    for tag, rec in _records(seq).items():
+        p = K.parse_tag(tag)
+        if not p or p[0] not in output_ids or rec.get("kind") != "section" or p[0] in out:
+            continue
+        sec = _resolve_section(seq, rec.get("section"))
+        if sec is None or not sec.is_active():
+            out.add(p[0])
+            continue
+        if rec.get("fp") is None:
+            continue
+        by = {str(c.channel_name): c for c in sec.get_all_channels()}
+        chans = [by.get(n) for n in rec.get("channels") or []]
+        if not chans or None in chans or _base_fp(sec, chans) != rec.get("fp"):
+            out.add(p[0])
+    return out
 
 
 # ------------------------------------------------------------------ commands
@@ -472,24 +824,55 @@ def _tag_counts(seq):
     return counts
 
 
+def _tolerance(bake):
+    return float(bake.get("key_tolerance") or K.DEFAULT_KEY_TOLERANCE)
+
+
 def _apply(seq, bake, start=0, only=None, remove_ids=()):
-    """one transaction: drop the tracks being replaced (plus remove_ids), write, prune emptied bindings"""
+    """one transaction: drop the tracks being replaced (plus remove_ids), write, prune emptied bindings.
+    multiply/add plans: read the base (never changed), write the offset as an additive section over it (or static x
+    gain as an absolute one) and record what it was applied over. Records of tracks that stop being blended go."""
     plans = _plans(seq, bake, start, only) if bake.get("outputs") else []
+    tol = _tolerance(bake)
     ctx = {"created": 0}
     written, errors, replaced, dropped = [], [], [], []
     n0 = len(_all_bindings(seq))
     t0 = time.perf_counter()
     with unreal.ScopedEditorTransaction("beatrig apply"):
-        for oid in sorted({p["output"] for p in plans}):
+        ids = sorted({p["output"] for p in plans})
+        for oid in ids:
             replaced += remove_ours(seq, oid)
         for oid in remove_ids:
             dropped += remove_ours(seq, oid)
+        records = _records(seq)
+        keep = {p["tag"] for p in plans if p["output_blend"] != "replace"}
+        for oid in sorted(set(ids) | set(remove_ids)):
+            _forget(seq, records, oid, keep)
         for p in plans:
             try:
-                _write(seq, p, ctx)
-                written.append({"tag": p["tag"], "kind": p["kind"], "value_type": p["value_type"],
-                                "keys": len(p["keys"]), "time_base": p["time_base"]})
+                if p["output_blend"] == "replace":
+                    _write(seq, p, ctx)
+                    written.append({"tag": p["tag"], "kind": p["kind"], "value_type": p["value_type"],
+                                    "keys": len(p["keys"]), "time_base": p["time_base"]})
+                    continue
+                held = {r["target"]: t for t, r in records.items() if r.get("target") and t != p["tag"]}
+                final, rec, warn = _blend(seq, p, records.get(p["tag"]), held, tol)
+                try:
+                    _write(seq, final, ctx)
+                except Exception:
+                    _remove_tag(seq, p["tag"])
+                    raise
+                _save_record(seq, p["tag"], rec)
+                records[p["tag"]] = rec
+                w = {"tag": p["tag"], "kind": p["kind"], "value_type": p["value_type"], "keys": len(final["keys"]),
+                     "time_base": p["time_base"], "blend": p["output_blend"], "section": final["blend"],
+                     "base": rec["track"] if rec["kind"] == "section" else "static", "range": final["range"]}
+                if warn:
+                    w["warning"] = warn
+                written.append(w)
             except Exception as e:
+                if p["output_blend"] != "replace" and records.pop(p["tag"], None) is not None:
+                    _drop_record(seq, p["tag"])                    # nothing written for this track: forget it
                 errors.append({"tag": p["tag"], "output": p["output"], "error": f"{type(e).__name__}: {e}"})
         pruned = _prune_owned(seq)
     return {"ok": not errors, "sequence": _pkg(seq), "written": written, "replaced": len(replaced),
@@ -536,8 +919,10 @@ def push(sequence, bake, hashes=None, expect=None, remove=None, start=0, refresh
     pkg = _pkg(seq)
     _record(seq, hashes, res)
     counts = _tag_counts(seq) if expect else {}
+    moved = _bases_changed(seq, set(expect)) if expect else set()      # a blended output whose base changed
     res["stale"] = sorted(oid for oid, (h, n) in (expect or {}).items()
-                          if _PUSHED.get((pkg, oid)) != h or counts.get(oid, 0) != int(n))
+                          if _PUSHED.get((pkg, oid)) != h or counts.get(oid, 0) != int(n) or oid in moved)
+    res["base_edited"] = sorted(moved)
     t0 = time.perf_counter()
     res["refreshed"] = _refresh(seq) if refresh else False
     res["refresh_ms"] = round((time.perf_counter() - t0) * 1000, 2)
@@ -545,11 +930,13 @@ def push(sequence, bake, hashes=None, expect=None, remove=None, start=0, refresh
 
 
 def undo(sequence, output_id=None, save=False, refresh=True):
-    """remove beatrig's tracks (all, or one output's) and the bindings it created that are now empty"""
+    """remove beatrig's tracks (all, or one output's), the bindings it created that are now empty, and the records of
+    multiply/add tracks. Base sections were never changed, so they play exactly as before."""
     seq = _load_seq(sequence)
     n0 = len(_all_bindings(seq))
     with unreal.ScopedEditorTransaction("beatrig undo"):
         removed = remove_ours(seq, output_id)
+        _forget(seq, _records(seq), output_id)
         pruned = _prune_owned(seq)
     refreshed = _refresh(seq) if refresh else False
     if save:
@@ -579,11 +966,34 @@ def _read_track(track, plan):
     return out
 
 
+def _check_blend(seq, plan, rec, tol):
+    """a multiply/add plan's expected track, recomputed from the target's current base exactly as apply computes it.
+    Returns (plan, problem or None)."""
+    if rec is None:
+        return None, "no base record (apply this output with its blend first)"
+    if rec.get("mode") != plan["output_blend"]:
+        return None, f"applied as {rec.get('mode')}, the bake says {plan['output_blend']}; apply again"
+    sec = _find_base(seq, plan)
+    if rec.get("kind") == "static":
+        if sec is not None:
+            return None, (f"a base section ({_track_name(sec.get_outer())}) now drives this target, but the track was "
+                          f"applied over a static value (Sequencer averages the two); apply again")
+        st = rec.get("static")
+        return _blend_from(seq, plan, None, tuple(st) if isinstance(st, list) else float(st), tol), None
+    if sec is None:
+        return None, (f"the base section ({rec.get('track')}) is gone or inactive, so the offset adds onto nothing; "
+                      f"apply again")
+    return _blend_from(seq, plan, sec, None, tol), None
+
+
 def check(sequence, bake, only=None, start=0):
-    """read every planned track back and compare it key for key with the bake"""
+    """read every planned track back and compare it key for key with the bake (multiply/add outputs: with the offset,
+    or static x gain, recomputed from the target's current base, so a base edited since the apply fails)"""
     seq = _load_seq(sequence)
     bake = _load_bake(bake)
     plans = _plans(seq, bake, start, only)
+    tol = _tolerance(bake)
+    records = _records(seq) if any(p["output_blend"] != "replace" for p in plans) else {}
     tracks = {}
     for t, _ in _all_tracks(seq):
         tracks.setdefault(_track_name(t), t)
@@ -594,6 +1004,16 @@ def check(sequence, bake, only=None, start=0):
         if t is None:
             rows.append({"tag": p["tag"], "ok": False, "error": "track missing"})
             continue
+        problem = None
+        if p["output_blend"] != "replace":
+            try:
+                final, problem = _check_blend(seq, p, records.get(p["tag"]), tol)
+            except Exception as e:
+                final, problem = None, f"{type(e).__name__}: {e}"
+            if final is None:
+                rows.append({"tag": p["tag"], "ok": False, "error": problem})
+                continue
+            p = final
         want, got = K.frame_keys(p, tpf), _read_track(t, p)
         if p["value_type"] == "color":
             rep = K.merge_reports([K.compare_keys(w, g) for w, g in zip(K.split_components(want), got)])
@@ -604,6 +1024,11 @@ def check(sequence, bake, only=None, start=0):
             if rep["param"] != p["param"]:
                 rep["ok"] = False
                 rep["error"] = f"track drives {rep['param']!r}, expected {p['param']!r}"
+        if p["output_blend"] != "replace":
+            rep["blend"] = p["output_blend"]
+            if problem:
+                rep["ok"] = False
+                rep["error"] = problem
         rep["tag"] = p["tag"]
         rows.append(rep)
     return {"ok": all(r["ok"] for r in rows), "sequence": _pkg(seq), "tracks": rows,
