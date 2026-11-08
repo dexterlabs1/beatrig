@@ -60,8 +60,10 @@ def _rise5(p):
     return np.concatenate((np.zeros(min(4, len(q))), np.maximum(q[4:] - q[:-4], 0)))
 
 
-def _win(r, k, h=2):
-    return float(r[max(0, k - h):k + h + 1].max())
+def _wmax(r, h=2):
+    """r's max over each index's +-h neighbours (an index's peak power, robust to the peak's exact block)"""
+    pad = np.concatenate((np.full(h, -np.inf), r, np.full(h, -np.inf)))
+    return np.lib.stride_tricks.sliding_window_view(pad, 2 * h + 1).max(axis=1)
 
 
 def _peaks(f, p):
@@ -71,28 +73,37 @@ def _peaks(f, p):
     pk = pk[f[pk] > 0]
     if not len(pk):
         return pk
-    pw = np.array([_win(p, k) for k in pk.tolist()])
+    pw = _wmax(p)[pk]
     reach = PRE_ECHO_MS // HOP_MS
-    end = np.searchsorted(pk, pk + reach, side="right")
-    echo = np.array([j1 > i + 1 and pw[i + 1:j1].max() >= PRE_ECHO_POWER * pw[i] for i, j1 in enumerate(end.tolist())])
-    return pk[~echo]
+    q = np.zeros(len(f) + reach + 1)
+    q[pk] = pw
+    later = np.lib.stride_tricks.sliding_window_view(q[1:], reach).max(axis=1)   # max over the next `reach` blocks
+    return pk[later[pk] < PRE_ECHO_POWER * pw]
 
 
 def _apart(pk, f, gap_ms):
     """the strongest peaks at least gap_ms apart (ties: the earlier), as the onsets op's min_gap_ms"""
     gap = max(1, int(round(float(gap_ms) / HOP_MS)))
+    if not len(pk):
+        return np.asarray(pk, np.int64)
+    taken = np.zeros(len(f) + 2 * gap, bool)                 # index k + gap = frame k
     kept = []
-    for k in sorted(pk.tolist(), key=lambda k: (-f[k], k)):
-        j = np.searchsorted(kept, k)
-        if (j == 0 or k - kept[j - 1] >= gap) and (j == len(kept) or kept[j] - k >= gap):
-            kept.insert(j, k)
-    return np.asarray(kept, np.int64)
+    for k in pk[np.lexsort((pk, -f[pk]))].tolist():         # strongest first; ties: the earlier
+        if not taken[k + 1:k + 2 * gap].any():               # no kept peak closer than gap
+            taken[k + gap] = True
+            kept.append(k)
+    return np.sort(np.asarray(kept, np.int64))
 
 
 def _ratio_after(p, pk, a_ms, b_ms):
-    """mean power a_ms..b_ms after each peak / the peak's power"""
+    """mean power a_ms..b_ms after each peak / the peak's power (0 where that span runs past the end)"""
     a0, a1 = a_ms // HOP_MS, b_ms // HOP_MS
-    return np.array([p[k + a0:k + a1].mean() / (_win(p, k) + 1e-20) if k + a1 <= len(p) else 0.0 for k in pk.tolist()])
+    cs = np.concatenate(([0.0], np.cumsum(p)))
+    ok = pk + a1 <= len(p)
+    out = np.zeros(len(pk))
+    k = pk[ok]
+    out[ok] = (cs[k + a1] - cs[k + a0]) / (a1 - a0) / (_wmax(p)[k] + 1e-20)
+    return out
 
 
 def _off_snares(a, pk, p, sn):
@@ -100,16 +111,13 @@ def _off_snares(a, pk, p, sn):
     rise is twice the song's median for snare hits"""
     if not len(sn) or not len(pk):
         return pk
-    rh = _rise5(p)
-    rs = _rise5(_power5(a, PARTS["snare"]["lo"], PARTS["snare"]["hi"]))
-    med = float(np.median([_win(rh, k) / (_win(rs, k) + 1e-20) for k in sn.tolist()]))
-    near = CLAP_LEAK_MS // HOP_MS
-    keep = np.ones(len(pk), bool)
-    for i, k in enumerate(pk.tolist()):
-        j = np.searchsorted(sn, k)
-        on_snare = any(0 <= jj < len(sn) and abs(int(sn[jj]) - k) <= near for jj in (j - 1, j))
-        keep[i] = not on_snare or _win(rh, k) / (_win(rs, k) + 1e-20) >= CLAP_LEAK_MULT * med
-    return pk[keep]
+    rh = _wmax(_rise5(p))
+    rs = _wmax(_rise5(_power5(a, PARTS["snare"]["lo"], PARTS["snare"]["hi"])))
+    med = float(np.median(rh[sn] / (rs[sn] + 1e-20)))
+    j = np.clip(np.searchsorted(sn, pk), 1, len(sn) - 1) if len(sn) > 1 else np.zeros(len(pk), int)
+    dist = np.minimum(np.abs(sn[j] - pk), np.abs(sn[np.maximum(j - 1, 0)] - pk))
+    on_snare = dist <= CLAP_LEAK_MS // HOP_MS
+    return pk[~on_snare | (rh[pk] / (rs[pk] + 1e-20) >= CLAP_LEAK_MULT * med)]
 
 
 def part_hits(a, part, threshold=0.3, min_gap_ms=None):
@@ -119,6 +127,14 @@ def part_hits(a, part, threshold=0.3, min_gap_ms=None):
     not set the hats' scale), with a floor at a third of it relative to every peak in the band."""
     spec = PARTS[part]
     gap = spec["min_gap_ms"] if min_gap_ms is None else min_gap_ms
+    memo = a.__dict__.setdefault("_drum_parts", {})          # hats reuse the snare hits; the structure reads all three
+    key = (part, float(threshold), float(gap))
+    if key not in memo:
+        memo[key] = _part_hits(a, part, spec, float(threshold), float(gap))
+    return memo[key]
+
+
+def _part_hits(a, part, spec, threshold, gap):
     p = _power5(a, spec["lo"], spec["hi"])
     f = a.onset_fn(spec["lo"], spec["hi"]).astype(np.float64)
     pk = _peaks(f, p)
@@ -131,7 +147,7 @@ def part_hits(a, part, threshold=0.3, min_gap_ms=None):
         pk = pk[_ratio_after(p, pk, *CLICK_MS) >= CLICK_MIN]
     pk = _apart(pk, f, gap)
     if part == "hats":
-        pk = _off_snares(a, pk, p, part_hits(a, "snare", threshold)[0])
+        pk = _off_snares(a, pk, p, np.asarray(part_hits(a, "snare", threshold)[0], np.int64))
     if not len(pk):
         return pk, np.zeros(0)
     rel = f[pk] / (np.percentile(f[pk], 95) + 1e-12)
