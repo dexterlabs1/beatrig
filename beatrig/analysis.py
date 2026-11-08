@@ -43,7 +43,7 @@ class _Lazy:
 
 sg = _Lazy("scipy.signal")
 
-ANALYSIS_VERSION = 4
+ANALYSIS_VERSION = 5
 ONSET_EDGES = [30, 60, 120, 240, 480, 960, 1920, 3840, 7680, 15360]   # octave bands for the onset function
 STEP_MS = 1                 # envelope grid
 HOP_MS = 5                  # onset grid
@@ -437,8 +437,11 @@ def beat_grid(f, ref_ons, duration, s):
         jitter = float(np.std(good) / T) if len(good) > 2 else 1.0
         agree, chance = agreement(times, ref_ons, T)
         zm = float(np.median([r["z"] for r in run]))
-        # tempo from a line fit through the beat times: the comb's period is quantised to the 5 ms lag grid
-        n_idx = np.round((times - times[0]) / T)
+        # tempo from a line fit through the beat times: the comb's period is quantised to the 5 ms lag grid. Each beat's
+        # index counts the periods between neighbours (round(interval / T), so a missed beat counts 2): rounding
+        # (t - t0) / T instead lets the quantised period's error pile up until a far beat gets the wrong index and
+        # bends the slope (a 128 BPM track with a 0.470 s comb period read as 127.68 and drifted 0.7 s by 4 minutes)
+        n_idx = np.concatenate(([0.0], np.cumsum(np.maximum(1.0, np.round(np.diff(times) / T)))))
         T_fit = float(np.polyfit(n_idx, times, 1)[0]) if n_idx[-1] > n_idx[0] else T
         conf = float(np.clip((zm - s["pulse_z"]) / 8 + 0.3, 0, 1) * np.clip(hit_rate, 0, 1) * np.clip(1.2 - jitter / 0.12, 0, 1)
                      * np.clip((agree - chance) / 0.4, 0, 1))

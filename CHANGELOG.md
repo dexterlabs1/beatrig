@@ -8,6 +8,11 @@ project uses [semantic versioning](https://semver.org/).
 ### Fixed
 - Preview page: with the playhead linked to a sequence that has its own audio track, the page mutes itself, so the
   music isn't heard twice. `playhead_get` reports `audio`.
+- Analysis: the tempo of a long passage drifted. The line fit through the verified beats indexed each beat by
+  `round((t - t0) / T)` with the comb's period, which sits on the 5 ms lag grid; the error piled up until far beats
+  took the wrong index. A 128 BPM track read as 127.68 and its tempo map was 0.7 s late by the fourth minute (so
+  `lfo`, patterns, `quantize`, beat delays and `subdivide` drifted). Beats are now indexed by the periods between
+  neighbours. The beat times themselves were always right. Analysis caches rebuild once (analysis version 5).
 
 ## [0.3.0] - 2026-11-07
 
