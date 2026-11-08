@@ -59,7 +59,7 @@ def test_separation_and_stem_nodes():
         {"id": "kmix", "op": "band", "lo": 40, "hi": 120},
         {"id": "on", "op": "onsets", "in": "k", "threshold": 0.3, "min_gap_ms": 150}], "outputs": []}, d)
     an = beatrig.analyze(rig)
-    assert set(an.stems) == {"drums"}
+    assert set(an.stems) == set(S.STEMS) and an.stems_info["used"]           # cached stems are always used (auto)
     sig = beatrig.evaluate(rig, an, {})
     assert sig["k"].v.max() > 0 and not np.array_equal(sig["k"].v, sig["kmix"].v)
     hits = np.flatnonzero(sig["on"].v[0])

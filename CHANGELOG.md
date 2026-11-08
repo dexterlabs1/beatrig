@@ -5,7 +5,28 @@ project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Better ears: stems by default, neural beats and bars, drum parts with no band to tune, labelled song sections.
+
 ### Added
+- **Neural beats and bars** (optional extra `[ml]`: the Beat This! tracker, MIT). `analysis.beats` `auto` (default)
+  uses it when installed. Every beat is checked against a real onset and written at that onset's time, never at the
+  model's frame, so beats stay "only where an onset supports them, never ahead of it". Each beat carries `bar` and
+  `pos`; analysis.json carries `bars` (meter, downbeats, confidence); the grid offset becomes a downbeat's phase, so
+  patterns and bar windows lock to real bars. A failed model run (no network for the first download) leaves the
+  classic grid, and the analysis says why. beatrig computes the model's spectrogram itself (no torchaudio import).
+- `beats` op `anchor: "bar"`: `every`/`offset` count on the bar grid (`every: 4` = downbeats), unshifted by beats
+  without an onset. `notes init --from downbeats`, MCP `notes_init(source="downbeats")`.
+- **Stems by default**: `analysis.stems` `auto` (default) uses cached stems and separates once when the `[stems]` extra
+  and a CUDA GPU are there; `on` separates on any device; `off` reads only stems that nodes name. The analysis
+  summary (CLI, MCP `analyze`, `Analysis.stems_label()`) says whether stem features read stems or the mix, and why.
+- **`drum` op** (`part` kick | snare | hats, `source` auto | stem | mix): drum-part hits from the drums stem (else the
+  mix) with built-in bands, stem pre-echo removed, snares told from kick clicks and hats from clicks and clap tails.
+  `notes init --from drum:kick`, MCP `notes_init(source="kick")`.
+- **Song structure**: `song_structure(analysis)`; `notes sections init` labels sections on bar lines (`intro`,
+  `groove`, `dip`, `build`, `breakdown`, `break`, `drop`, `outro`, numbered repeats) from a multi-scale novelty over
+  stem levels, drum-part densities and band levels, plus drums/bass presence changes. `--method energy` keeps the
+  v0.2 rule. MCP `describe_audio` lists the sections.
+- `BEATRIG_EXTRAS=off` makes `auto` analysis settings behave like a core install (the test suite sets it).
 - `normalize` `ref_db` / `floor_db`: a fixed level scale instead of the bake's own percentiles, so a louder mix
   drives harder. `beatrig pin-levels <rig>` writes each node's current top and floor (the bake on that audio is
   unchanged).
@@ -21,7 +42,22 @@ project uses [semantic versioning](https://semver.org/).
   follows the page's playhead and edits; its transport drives the page, which plays the audio, so nothing is heard
   twice. On its own it plays silently. The page folds its own preview away while one is open.
 
+### Measured (one 4.5-minute 128 BPM house track, RTX 5090; the synthetic demo has exact truth)
+| | before | after |
+|---|---|---|
+| Tempo map | 127.68 BPM (0.2 s off the beats by the end) | 128.00 BPM |
+| Beat F-measure vs the true grid (±70 ms) | 0.987 | 0.992 |
+| Downbeat F-measure (`beats every 4`) | 0.10 (demo: 0.0) | 0.99 (demo: 0.96) |
+| Section boundaries within ±1 bar of a hand annotation | 7/9, precision 7/11 | 9/9, precision 9/10 |
+| Section labels matching the hand annotation | 2/10 | 10/10 (8/9 boundaries and weaker labels without stems) |
+| Snare precision / recall, demo drums stem (`onsets` 180-2500 Hz vs `drum`) | 0.29 / 0.86 | 0.96 / 0.79 |
+| Hats precision / recall, demo drums stem (`onsets` 6-16 kHz vs `drum`) | 1.00 / 0.97 | 1.00 / 0.77 (the demo's hats on every snare are left to the snare track) |
+| Real track, drums stem: snare hits on beats 2 and 4 / hats hits on beats 2 and 4 (clap tails) | 40 % / 27 % | 66 % / 1 % |
+| Cold analysis (stems cached) / separation / model | 1.7 s / - / - | 9.0 s / 5.1 s / 1.4 s |
+
 ### Changed
+- Each stem has its own analysis cache folder (they used to share one file and overwrite each other).
+- `stems.available()` looks the packages up without importing torch.
 - Preview page: refined UI. A grouped transport with an m:ss.mmm timecode, a type scale on the system UI font with
   tabular figures, 4/8 px spacing, readable lane heads, node cards in the graph panel, keyboard keys in the help, and
   clear empty, offline and load-failure states with a connection indicator. The canvases take their colours and font
@@ -30,6 +66,11 @@ project uses [semantic versioning](https://semver.org/).
 ### Fixed
 - Preview page: with the playhead linked to a sequence that has its own audio track, the page mutes itself, so the
   music isn't heard twice. `playhead_get` reports `audio`.
+- Analysis: the tempo of a long passage drifted. The line fit through the verified beats indexed each beat by
+  `round((t - t0) / T)` with the comb's period, which sits on the 5 ms lag grid; the error piled up until far beats
+  took the wrong index. A 128 BPM track read as 127.68 and its tempo map was 0.7 s late by the fourth minute (so
+  `lfo`, patterns, `quantize`, beat delays and `subdivide` drifted). Beats are now indexed by the periods between
+  neighbours. The beat times themselves were always right. Analysis caches rebuild once (analysis version 5).
 
 ## [0.3.0] - 2026-11-07
 

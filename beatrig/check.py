@@ -18,7 +18,9 @@ ENUMS = {("lfo", "shape"): LFO_SHAPES, ("envelope", "shape"): SHAPES, ("math", "
          ("merge", "fn"): ["max", "mean"], ("curve", "preset"): list(CURVE_PRESETS),
          ("shuffle_hits", "mode"): ["bag", "random"], ("spatial_delay", "shape"): ["point", "axis", "plane"],
          ("spatial_delay", "direction"): ["out", "in"], ("dome_wave", "mode"): ["zenith_rings", "azimuth_sweep"],
-         ("flash_limit", "mode"): ["first", "drop", "delay", "strongest"], ("beats", "velocity"): ["strength", "confidence"]}
+         ("flash_limit", "mode"): ["first", "drop", "delay", "strongest"], ("beats", "velocity"): ["strength", "confidence"],
+         ("beats", "anchor"): ["first", "bar"], ("drum", "part"): ["kick", "snare", "hats"],
+         ("drum", "source"): ["auto", "stem", "mix"]}
 BLENDS = ("replace", "multiply", "add")
 TRIGGER_IN = ("envelope", "cycle", "push", "shuffle_hits", "every_n", "probability", "quantize")
 SPATIAL = ("spatial_delay", "dome_wave")
@@ -81,6 +83,14 @@ def check(rig, notes: Optional[dict] = None, bake: Optional[dict] = None) -> lis
         err("rig.channel_weights", "must be a list of weights >= 0, one per audio channel (e.g. 5.1: [1, 1, 1, 0.5, 0.7, 0.7])")
     if d.get("cache_dir") is not None and (not isinstance(d["cache_dir"], str) or not d["cache_dir"].strip()):
         err("rig.cache_dir", "must be a folder path (relative to the rig) for the analysis cache")
+    an = d.get("analysis")
+    if an is not None and not isinstance(an, dict):
+        err("rig.analysis", "must be an object of analysis settings")
+    elif an:
+        if an.get("beats", "auto") not in ("auto", "neural", "classic"):
+            err("rig.analysis.beats", "must be \"auto\" (neural when the [ml] extra is installed), \"neural\" or \"classic\"")
+        if an.get("stems", "auto") not in ("auto", "on", "off"):
+            err("rig.analysis.stems", "must be \"auto\" (separate on a CUDA GPU when the [stems] extra is installed), \"on\" or \"off\"")
     tempo = d.get("tempo") or {}
     if tempo.get("bpm") is not None and (not _num(tempo["bpm"]) or tempo["bpm"] <= 0):
         err("rig.tempo.bpm", "bpm must be > 0")

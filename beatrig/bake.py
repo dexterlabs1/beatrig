@@ -46,38 +46,85 @@ def analyze(rig: Rig, use_cache: bool = True) -> Optional[Analysis]:
     """Build or load the analysis cache (analysis.json/.npz in rig.cache_dir, default next to the rig) and compute every
     band the rig uses. Returns None for a rig without audio. The cache is invalidated by the audio's size/mtime or the
     analysis settings.
-    Nodes that read a stem ("stem": "drums") also get that stem's analysis (cached in the stem folder) as
-    analysis.stems[name]; the stems must have been separated first (beatrig stems <rig>)."""
+    Stems (analysis.stems = {name: Analysis}, each cached in its own folder next to the stem wavs): with
+    analysis.stems "auto" (the default) cached stems are always used, and a missing separation runs once when the
+    [stems] extra and a CUDA GPU are there; "on" separates on any device; "off" reads only the stems that nodes name.
+    analysis.stems_info says what was used, or why the mix stands in."""
     if not rig.audio_path:
         return None
     if not os.path.exists(rig.audio_path):
         hint = " (generate the demo track with: python examples/make_demo_audio.py)" if "demo_110bpm" in rig.audio_path else ""
         raise RigError(f"audio not found: {rig.audio_path}{hint}")
     a = open_analysis(rig.audio_path, rig.cache_dir, rig.data.get("analysis"), rig.data.get("channel_weights"), use_cache)
-    a.ensure(analysis_reqs(rig))
+    a.stems, a.stems_info = open_stems(rig, a, use_cache)
+    reqs = analysis_reqs(rig)
+    if "drums" not in a.stems or any(n.get("op") == "drum" and n.get("source") == "mix" for n in rig.nodes):
+        reqs += drum_reqs(rig)                                # drum parts read the mix
+    a.ensure(reqs)
     a.save()
-    a.stems = open_stems(rig, use_cache)
     return a
 
 
-def open_stems(rig: Rig, use_cache: bool = True) -> dict:
-    """{stem: Analysis} for the stems the rig's nodes read"""
+def drum_reqs(rig: Rig) -> list:
+    """the drum-part bands, when the rig has a drum node"""
+    from .drums import part_bands
+    if not any(n.get("op") == "drum" for n in rig.nodes):
+        return []
+    return [("band", lo, hi, None) for lo, hi in part_bands().values()]
+
+
+def _stem_mode(a, rig):
+    return (rig.data.get("analysis") or {}).get("stems", "auto") if a is None else a.settings.get("stems", "auto")
+
+
+def open_stems(rig: Rig, a: Optional[Analysis] = None, use_cache: bool = True):
+    """({stem: Analysis}, info) for the stems the rig reads: the ones its nodes name, and with analysis.stems auto/on
+    all four (drum parts and song structure read them). info = {"used", "why"} (+ the separation's model, device,
+    seconds and folder when used)."""
+    from . import neural
     from . import stems as S
-    names = S.used_stems(rig.nodes)
-    if not names:
-        return {}
-    paths = S.cached(rig.audio_path)
+    mode = _stem_mode(a, rig)
+    names = set(S.used_stems(rig.nodes))
+    paths = S.cached(rig.audio_path, digest=a.content_hash() if a is not None else None)
+    why = ""
     if paths is None:
-        raise RigError(f"nodes read stems {names} but they are not separated yet: run 'beatrig stems {rig.path or '<rig>'}'")
+        if mode == "off":
+            why = "analysis.stems is off"
+        elif mode == "auto" and neural.disabled():
+            why = "BEATRIG_EXTRAS=off"
+        else:
+            ok, why = S.available()
+            if ok and mode == "auto" and not S.cuda_available():
+                ok, why = False, "no CUDA GPU (beatrig stems <rig> separates on the CPU, slowly; or set analysis.stems to \"on\")"
+            if ok:
+                paths = S.separate(rig.audio_path, log=log.info)
+        if paths is None:
+            if names:
+                raise RigError(f"nodes read stems {sorted(names)} but they are not separated yet ({why}): "
+                               f"run 'beatrig stems {rig.path or '<rig>'}'")
+            return {}, {"used": False, "why": why}
+    unknown = sorted(n for n in names if n not in paths)
+    if unknown:
+        raise RigError(f"unknown stem {unknown[0]!r} (one of {S.STEMS})")
+    use = sorted(names if mode == "off" else names | set(S.STEMS))
+    settings = dict(rig.data.get("analysis") or {}, beats="none")
     out = {}
-    for name in names:
-        if name not in paths:
-            raise RigError(f"unknown stem {name!r} (one of {S.STEMS})")
-        sa = open_analysis(paths[name], os.path.dirname(paths[name]), rig.data.get("analysis"), None, use_cache)
-        sa.ensure(analysis_reqs(rig, name))
+    for name in use:
+        sa = open_analysis(paths[name], S.stem_cache_dir(paths[name]), settings, None, use_cache)
+        reqs = analysis_reqs(rig, name)
+        if name == "drums":
+            from .drums import part_bands
+            reqs += [("band", lo, hi, None) for lo, hi in part_bands().values()]
+        if mode != "off":
+            reqs.append(("loud", None, None, None))           # stem levels for the song structure
+        sa.ensure(reqs)
         sa.save()
         out[name] = sa
-    return out
+    if mode == "off":
+        return out, {"used": False, "why": "analysis.stems is off" + (f" (nodes read {', '.join(use)})" if use else "")}
+    meta = S.info(paths)
+    return out, {"used": True, "why": "", "dir_name": os.path.basename(os.path.dirname(paths["drums"])),
+                 **{k: meta[k] for k in ("model", "device", "seconds") if k in meta}}
 
 
 def frame_count(rig: Rig, analysis: Optional[Analysis]) -> int:

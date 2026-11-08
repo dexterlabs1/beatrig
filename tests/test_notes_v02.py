@@ -88,11 +88,13 @@ def test_sections_init_and_pattern_cli_on_the_demo(capsys):
     assert cli(["notes", "sections", "init", rp]) == 0
     n = beatrig.load_notes(os.path.join(d, "notes.json"))
     names = [s["name"] for s in n["sections"]]
-    assert names == ["intro", "breakdown", "main"], n["sections"]
+    assert names == ["intro", "breakdown", "drop"], n["sections"]                         # labelled structure (default)
     bar = 4 * 60 / 110
     t_break, t_back = n["sections"][1]["time"], n["sections"][2]["time"]
     assert 7 * bar <= t_break < 7 * bar + 0.05 and 10 * bar <= t_back < 10 * bar + 0.05   # on the bar, never early
     assert cli(["notes", "sections", "init", rp]) == 2                                     # refuses to overwrite
+    assert cli(["notes", "sections", "init", rp, "--replace", "--method", "energy"]) == 0   # the v0.2 energy rule
+    assert [s["name"] for s in beatrig.load_notes(os.path.join(d, "notes.json"))["sections"]] == ["intro", "breakdown", "main"]
     assert cli(["notes", "pattern", "make", rp, "--name", "four", "--length-beats", "4", "--hits", "0:1,1:0.8,2:1,3:0.8"]) == 0
     assert cli(["notes", "pattern", "place", rp, "--name", "four", "--track", "kick", "--at-beat", "8", "--repeat", "3"]) == 0
     assert cli(["notes", "pattern", "list", rp]) == 0

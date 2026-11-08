@@ -275,6 +275,7 @@ def analyze(rig_path: str) -> str:
         "bpm": m["bpm_map"][0]["bpm"] if m.get("bpm_map") else None, "bpm_map": m.get("bpm_map"),
         "grid_offset_s": _r(m.get("grid_offset")), "beats": len(m.get("beats") or []),
         "pulse": m.get("pulse"), "low_confidence_tempo": bool(m.get("fallback")),
+        "beat_tracker": a.tracker_label(), "bars": a.bars_summary(), "stems": a.stems_label(),
         "passages": [{k: p_.get(k) for k in ("start", "end", "bpm", "confidence")} for p_ in m.get("passages") or []][:12],
         "cache": "hit" if a.loaded_from_cache else "built",
         "suggested_bands": [b["band"] for b in good][:3],
@@ -287,7 +288,8 @@ def analyze(rig_path: str) -> str:
 def describe_audio(rig_path: str, start_s: float = 0.0, end_s: float | None = None, window_s: float | None = None) -> str:
     """Describe the song so you can reason about its structure without hearing it: per time window (default one bar),
     the level of each band (0..1, dB-scaled over the whole song) and its hit count, plus candidate section boundaries
-    where the energy changes sharply. Boundaries are energy changes, not labelled sections."""
+    where the energy changes sharply, and the labelled song structure (intro / build / breakdown / drop / outro ...) on
+    bar lines."""
     import scipy.signal as sg
     p, data, rig = _load(rig_path)
     a = _analysis(rig)
@@ -334,9 +336,12 @@ def describe_audio(rig_path: str, start_s: float = 0.0, end_s: float | None = No
                             "rose": [names[k] for k in np.flatnonzero(d >= 0.2)],
                             "fell": [names[k] for k in np.flatnonzero(d <= -0.2)]})
     beats = [b["time"] for b in m.get("beats") or [] if t0 <= b["time"] < t1]
+    from .analysis import song_structure
+    secs = [{k: s[k] for k in ("name", "time", "bars", "kick", "bass_db", "energy_db")} for s in song_structure(a)]
     return _j({"range_s": [_r(t0, 2), _r(t1, 2)], "window_s": _r(w, 3), "bpm": bpm, "beats_in_range": len(beats),
-               "bands": names, "rows": rows, "candidate_boundaries": changes,
-               "legend": "level per band 0..1 (dB over the whole song), hits = clear onsets in that band per window"})
+               "bands": names, "rows": rows, "candidate_boundaries": changes, "sections": secs, "stems": a.stems_label(),
+               "legend": "level per band 0..1 (dB over the whole song), hits = clear onsets in that band per window; "
+                         "sections = labelled song structure on bar lines (notes sections init writes them)"})
 
 
 # ------------------------------------------------------------------------------------------------ rig tools
@@ -511,8 +516,10 @@ def get_notes(rig_path: str, track: str | None = None, start_s: float = 0.0, end
 @tool
 def notes_init(rig_path: str, track: str, source: str, threshold: float | None = None, replace: bool = False) -> str:
     """Fill a notes track from the audio. source: "band:LO-HI" (onsets in that Hz range, e.g. "band:40-120"),
-    "onsets:<node id>", "beats" (the verified beat grid) or "beats:<node id>". Refuses to overwrite an existing track
-    unless replace=true. Seeds the notes tempo map from the analysis if it has none."""
+    "onsets:<node id>", "beats" (the verified beat grid), "beats:<node id>", "downbeats" (the bar lines, when the
+    analysis knows them; else every 4th beat of the tempo map) or "kick" / "snare" / "hats" (drum parts, from the
+    separated drums stem when there is one, else the mix; the result says which). Refuses to overwrite an existing
+    track unless replace=true. Seeds the notes tempo map from the analysis if it has none."""
     from .bake import make_ctx
     from .ops import beat_times, detect_onsets
     p, data, rig = _load(rig_path)
@@ -538,12 +545,24 @@ def notes_init(rig_path: str, track: str, source: str, threshold: float | None =
         node = rig.node(arg) if arg else {"id": "_beats", "op": "beats"}
         if node is None or node.get("op") != "beats":
             raise ToolFailure(f"beats:<id> needs a beats node id, got {arg!r}")
+    elif kind == "downbeats":
+        node = {"id": "_downbeats", "op": "beats", "every": int((a.meta.get("bars") or {}).get("meter") or 4), "anchor": "bar"}
+    elif kind in ("kick", "snare", "hats", "drum"):
+        node = {"id": f"_{track}", "op": "drum", "part": arg if kind == "drum" else kind}
+        if node["part"] not in ("kick", "snare", "hats"):
+            raise ToolFailure('drum source is "kick", "snare" or "hats"')
     else:
-        raise ToolFailure('source must be "band:LO-HI", "onsets:<node>", "beats" or "beats:<node>"')
+        raise ToolFailure('source must be "band:LO-HI", "onsets:<node>", "beats", "beats:<node>", "downbeats", "kick", "snare" or "hats"')
     if threshold is not None and node.get("op") == "onsets":
         node = dict(node, threshold=float(threshold))
+    read = None
     if node["op"] == "onsets":
         times, vels = detect_onsets(node, ctx, rig.nodes)
+    elif node["op"] == "drum":
+        from .drums import drum_times
+        if threshold is not None:
+            node["threshold"] = float(threshold)
+        times, vels, read = drum_times(node, ctx)
     else:
         times, vels = beat_times(node, ctx)
     if not notes["bpm_map"]:
@@ -552,6 +571,8 @@ def notes_init(rig_path: str, track: str, source: str, threshold: float | None =
     notes["tracks"][track] = [{"time": float(t), "vel": round(float(v), 3)} for t, v in zip(times, vels)]
     _save_notes(rig, notes)
     diff = {"track": track, "source": source, "hits": [before, len(times)]}
+    if read is not None:
+        diff["read_from"] = "drums stem" if read == "stem" else f"mix: {a.stems_label()}"
     preview = _notify("notes_init", f"{track}: {len(times)} hits from {source}")
     return _j({"ok": True, "diff": diff, "summary": _track_summary(notes["tracks"][track]), "preview": preview,
                "next": f"add a node {{\"op\": \"notes\", \"track\": \"{track}\"}} to use it"})

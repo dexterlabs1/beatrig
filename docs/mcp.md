@@ -21,8 +21,8 @@ Conventions:
 
 | Tool | Args | Returns |
 |---|---|---|
-| `analyze` | `rig_path` | duration, sample rate, `bpm`, `bpm_map`, beat count, pulse confidence, tempo passages, and `bands`: for each candidate range (sub 30-60, kick 40-120, bass 80-250, lowmid 250-800, mid 800-2500, presence 2500-6000, air 6000-14000 Hz) the hit count, `hits_per_beat`, `on_beat` (share of hits within 60 ms of a beat), `contrast_db` (how far hits stand above the background) and `level_db`. `suggested_bands` lists up to three with the clearest hits. These are frequency ranges, not detected instruments. |
-| `describe_audio` | `rig_path`, `start_s`, `end_s`, `window_s` (default one bar, at most 48 rows) | per window: each band's level (0..1, dB-scaled over the whole song) and hit count; `candidate_boundaries` where the band levels change sharply, with which bands rose and fell. |
+| `analyze` | `rig_path` | duration, sample rate, `bpm`, `bpm_map`, beat count, pulse confidence, tempo passages, and `bands`: for each candidate range (sub 30-60, kick 40-120, bass 80-250, lowmid 250-800, mid 800-2500, presence 2500-6000, air 6000-14000 Hz) the hit count, `hits_per_beat`, `on_beat` (share of hits within 60 ms of a beat), `contrast_db` (how far hits stand above the background) and `level_db`. `suggested_bands` lists up to three with the clearest hits. These are frequency ranges, not detected instruments. Also `beat_tracker` (neural or classic, and why), `bars` (meter, bar count, first downbeat, confidence; null without the neural tracker) and `stems` (whether stem features read separated stems or the mix, and why). |
+| `describe_audio` | `rig_path`, `start_s`, `end_s`, `window_s` (default one bar, at most 48 rows) | per window: each band's level (0..1, dB-scaled over the whole song) and hit count; `candidate_boundaries` where the band levels change sharply, with which bands rose and fell; `sections`: the labelled song structure on bar lines (name, time, bars, kicks per bar, bass and level in dB), what `notes sections init` writes. |
 
 ## The rig
 
@@ -43,7 +43,7 @@ Conventions:
 | Tool | Args | Notes |
 |---|---|---|
 | `get_notes` | `rig_path`, `track`, `start_s`, `end_s`, `limit` | track summaries; hits of one track in a range |
-| `notes_init` | `rig_path`, `track`, `source`, `threshold`, `replace` | `source`: `band:LO-HI`, `onsets:<node>`, `beats`, `beats:<node>`. Won't overwrite a non-empty track without `replace=true`. Seeds the notes tempo map from the analysis. |
+| `notes_init` | `rig_path`, `track`, `source`, `threshold`, `replace` | `source`: `band:LO-HI`, `onsets:<node>`, `beats`, `beats:<node>`, `downbeats` (bar lines), `kick` / `snare` / `hats` (drum parts; `diff.read_from` says drums stem or mix). Won't overwrite a non-empty track without `replace=true`. Seeds the notes tempo map from the analysis. |
 | `notes_edit` | `rig_path`, `track`, `edits`, `tolerance_ms` | all-or-nothing list of `{"action": "add", "time", "vel", "len_beats"?, "shape"?}`, `{"action": "move", "time", "to"}`, `{"action": "delete", "time"}`, `{"action": "velocity", "time", "vel"}` |
 | `notes_snap` | `rig_path`, `track`, `grid`, `strength` | quantise to `1/4`, `1/8`, `1/16` (or a number of beats). Reports `max_earlier_ms`: snapping a hit earlier can put the visual ahead of its sound. |
 

@@ -12,6 +12,9 @@ import soundfile as sf
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+# "auto" analysis settings behave like a core install unless a test asks for the extras itself, so the suite gives the
+# same results with or without torch / demucs / beat-this installed (and never separates every test clip)
+os.environ.setdefault("BEATRIG_EXTRAS", "off")
 
 from beatrig.ops import Ctx  # noqa: E402
 from beatrig.tempo import Tempo  # noqa: E402

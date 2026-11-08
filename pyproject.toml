@@ -31,6 +31,7 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=1.2"]
 stems = ["torch>=2.1", "demucs>=4.0"]
+ml = ["torch>=2.1", "beat-this>=1.1", "einops>=0.6", "rotary-embedding-torch>=0.5"]
 dev = ["pytest>=7"]
 
 [project.scripts]
