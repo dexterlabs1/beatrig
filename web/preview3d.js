@@ -264,7 +264,8 @@ void main() {
       this.fog = 0;                                                        // fog density per cm (0 = off)
       this.bloom = 0.55;                                                   // bloom strength (0 = off)
       this.clearRGBA = new Float32Array(4); this.clearZ = new Float32Array([1]);
-      this.u1 = new Float32Array(3); this.gain1 = new Float32Array(1); this.zero1 = new Float32Array(1);                                       // fog, dpr, bloom as uniform vectors (no boxed floats)
+      this.u1 = new Float32Array(3); this.gain1 = new Float32Array(1); this.zero1 = new Float32Array(1);
+      this.fogU = this.u1.subarray(0, 1); this.dprU = this.u1.subarray(1, 2); this.bloomU = this.u1.subarray(2, 3);   // views made once                                       // fog, dpr, bloom as uniform vectors (no boxed floats)
       this.screen = false;
       this.w = 1; this.h = 1; this.ss = 1;
       this.lost = false;
@@ -385,8 +386,10 @@ void main() {
       gl.bindBuffer(gl.ARRAY_BUFFER, this.lStatic.b);
       gl.bufferData(gl.ARRAY_BUFFER, data || new Float32Array(0), gl.STATIC_DRAW);
     }
-    // perspective camera from an eye point and unit axes (UE forward / right / up), vertical fov in radians
-    camera(eye, F, R, U, vfov, aspect, near, far) {
+    // perspective camera from an eye point and unit axes (UE forward / right / up); lens = [vertical fov in radians,
+    // aspect, near, far] (an array, so no float arguments are boxed per frame)
+    camera(eye, F, R, U, lens) {
+      const vfov = lens[0], aspect = lens[1], near = lens[2], far = lens[3];
       const f = 1 / Math.tan(vfov / 2), A = (far + near) / (far - near), B = -2 * far * near / (far - near), m = this.vp;
       const tr = -(R[0] * eye[0] + R[1] * eye[1] + R[2] * eye[2]);
       const tu = -(U[0] * eye[0] + U[1] * eye[1] + U[2] * eye[2]);
@@ -432,7 +435,7 @@ void main() {
       gl.viewport(0, 0, off ? tw : w, off ? th : h);
       const bg = this.bg, a = this.amb, cc = this.clearRGBA, fc = this.fogCol, U1 = this.u1;
       U1[0] = this.screen ? 0 : this.fog; U1[1] = this.dpr; U1[2] = this.bloom;
-      const fog = U1.subarray(0, 1);
+      const fog = this.fogU;
       cc[0] = bg[0] + a[0] * 0.006; cc[1] = bg[1] + a[1] * 0.006; cc[2] = bg[2] + a[2] * 0.006; cc[3] = 1;
       fc[0] = cc[0]; fc[1] = cc[1]; fc[2] = cc[2];
       gl.depthMask(true);
@@ -477,7 +480,7 @@ void main() {
         const u = this.pSprite.u;
         gl.useProgram(this.pSprite.p);
         gl.uniformMatrix4fv(u.uVP, false, this.vp);
-        gl.uniform2fv(u.uProj, this.proj); gl.uniform1fv(u.uDpr, U1.subarray(1, 2));
+        gl.uniform2fv(u.uProj, this.proj); gl.uniform1fv(u.uDpr, this.dprU);
         gl.uniform2f(u.uViewport, w, h);                // sprite sizes are in canvas pixels, whatever the buffer size
         gl.uniform1f(u.uScreen, this.screen ? 1 : 0);
         gl.uniform3fv(u.uEye, this.eye); gl.uniform1fv(u.uFog, fog);
@@ -531,7 +534,7 @@ void main() {
         gl.useProgram(this.pComp.p);
         gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, F.rs.t); gl.uniform1i(cu.uTex, 0);
         gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bloomOn ? B[0].t : F.rs.t); gl.uniform1i(cu.uBloom, 1);
-        gl.uniform1fv(cu.uBloomK, bloomOn ? U1.subarray(2, 3) : this.zero1);
+        gl.uniform1fv(cu.uBloomK, bloomOn ? this.bloomU : this.zero1);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
         gl.activeTexture(gl.TEXTURE0);
       }

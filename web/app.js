@@ -1585,6 +1585,7 @@ const P3 = {
 };
 const VFOV = 40 * Math.PI / 180;
 const F3 = new Float32Array(3), R3 = new Float32Array(3), U3 = new Float32Array(3), EYE = new Float32Array(3), PXY = new Float32Array(2);
+const LENS = new Float64Array(4);                                   // vertical fov, aspect, near, far
 const AXIS = { x: 0, y: 1, z: 2 }, ROT_AXIS = { pitch: 0, yaw: 1, roll: 2, y: 0, z: 1, x: 2 };   // scene rotation = [pitch, yaw, roll]
 function gridStep(v) { for (const s of [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000]) if (s >= v) return s; return 100000; }
 
@@ -1762,13 +1763,15 @@ function setupCamera(m, mode) {
     EYE[0] = +c.location[0] || 0; EYE[1] = +c.location[1] || 0; EYE[2] = +c.location[2] || 0;
     const hfov = clamp(+c.fov || 90, 5, 170) * Math.PI / 180;           // Unreal's field of view is horizontal
     const far = m.radius * 8 + Math.hypot(EYE[0] - m.centre[0], EYE[1] - m.centre[1], EYE[2] - m.centre[2]);
-    r.camera(EYE, F3, R3, U3, 2 * Math.atan(Math.tan(hfov / 2) / aspect), aspect, Math.max(1, m.radius * 0.002), far);
+    LENS[0] = 2 * Math.atan(Math.tan(hfov / 2) / aspect); LENS[1] = aspect; LENS[2] = Math.max(1, m.radius * 0.002); LENS[3] = far;
+    r.camera(EYE, F3, R3, U3, LENS);
     return;
   }
   const o = P3.orbit;
   basisTo(o.pitch, o.yaw, 0);
   EYE[0] = o.t[0] - F3[0] * o.dist; EYE[1] = o.t[1] - F3[1] * o.dist; EYE[2] = o.t[2] - F3[2] * o.dist;
-  r.camera(EYE, F3, R3, U3, VFOV, aspect, Math.max(0.5, o.dist * 0.005), o.dist + m.radius * 8);
+  LENS[0] = VFOV; LENS[1] = aspect; LENS[2] = Math.max(0.5, o.dist * 0.005); LENS[3] = o.dist + m.radius * 8;
+  r.camera(EYE, F3, R3, U3, LENS);
 }
 function draw3D(f, force) {
   const r = P3.r;
@@ -1925,15 +1928,15 @@ function drawMeters(f) {
     meterCv.hidden = !H;
     meterCv.width = Math.round(P3.mw * P3.dpr); meterCv.height = Math.round(H * P3.dpr);
     if (!meterImg || meterImg.width < maxN) { meterRowCv.width = maxN; meterRowCv.height = 1; meterImg = meterRowCtx.createImageData(maxN, 1); }
+    const c2 = meterCv.getContext("2d");
+    c2.setTransform(P3.dpr, 0, 0, P3.dpr, 0, 0); c2.font = F11; c2.textBaseline = "middle"; c2.imageSmoothingEnabled = false;
     P3.meterF = null;
   }
   const rows = P3.meterRows;
   if (!rows.length || f === P3.meterF) return;
   P3.meterF = f;
   const H = rows.length * rowH + 8, ctx = meterCv.getContext("2d"), w = P3.mw, px = meterImg.data;
-  ctx.setTransform(P3.dpr, 0, 0, P3.dpr, 0, 0);
   ctx.fillStyle = C.panel; ctx.fillRect(0, 0, w, H);
-  ctx.font = F11; ctx.textBaseline = "middle";
   const x0 = 96, bw = w - 64 - x0, hh = rowH - 6;
   for (let i = 0; i < rows.length; i++) {
     const R = rows[i], y = 4 + i * rowH, mid = y + rowH / 2, s = S.series.get(R.key), n = R.n;
@@ -1948,7 +1951,6 @@ function drawMeters(f) {
         px[k + 3] = 255;
       }
       meterRowCtx.putImageData(meterImg, 0, 0);
-      ctx.imageSmoothingEnabled = false;
       ctx.drawImage(meterRowCv, 0, 0, n, 1, x0, y + 3, bw, hh);
       if (gap) { ctx.fillStyle = C.panel; for (let c = 1; c < n; c++) ctx.fillRect(Math.round(x0 + (c * bw) / n) - 1, y + 3, 1, hh); }
       ctx.fillStyle = C.faint; ctx.textAlign = "right"; ctx.fillText("colour", w - 12, mid);
