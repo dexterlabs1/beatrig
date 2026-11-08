@@ -127,21 +127,23 @@ void main() {
     return new Float32Array(out);
   }
 
+  // Shaders compile in the GPU process while the page goes on loading: nothing here asks for their status, which
+  // would wait for them. link() does that once, at the first draw (by then the page's data has arrived).
   function compile(gl, vs, fs) {
-    const mk = (type, src) => {
-      const s = gl.createShader(type);
-      gl.shaderSource(s, src); gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS) && !gl.isContextLost()) throw new Error(gl.getShaderInfoLog(s));
-      return s;
-    };
-    const p = gl.createProgram();
-    gl.attachShader(p, mk(gl.VERTEX_SHADER, vs)); gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fs));
+    const mk = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+    const p = gl.createProgram(), v = mk(gl.VERTEX_SHADER, vs), f = mk(gl.FRAGMENT_SHADER, fs);
+    gl.attachShader(p, v); gl.attachShader(p, f);
     gl.linkProgram(p);
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS) && !gl.isContextLost()) throw new Error(gl.getProgramInfoLog(p));
-    const u = {};
-    const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS) || 0;
-    for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(p, i); u[info.name] = gl.getUniformLocation(p, info.name); }
-    return { p, u };
+    return { p, v, f, u: null };
+  }
+  function link(gl, prog) {
+    if (prog.u) return;
+    if (!gl.getProgramParameter(prog.p, gl.LINK_STATUS) && !gl.isContextLost()) {
+      throw new Error(gl.getShaderInfoLog(prog.v) || gl.getShaderInfoLog(prog.f) || gl.getProgramInfoLog(prog.p) || "shader link failed");
+    }
+    const u = {}, n = gl.getProgramParameter(prog.p, gl.ACTIVE_UNIFORMS) || 0;
+    for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(prog.p, i); u[info.name] = gl.getUniformLocation(prog.p, info.name); }
+    prog.u = u;
   }
 
   class Renderer {
@@ -156,6 +158,7 @@ void main() {
       this.nLines = 0; this.nGrid = 0;
       this.fade = new Float32Array(3); this.amb = new Float32Array(3);    // amb: ambient light colour x level (0..1)
       this.bg = new Float32Array([0.005, 0.0056, 0.006]);
+      this.clearRGBA = new Float32Array(4); this.clearZ = new Float32Array([1]);
       this.screen = false;
       this.w = 1; this.h = 1;
       this.lost = false;
@@ -165,6 +168,7 @@ void main() {
     }
     init() {
       const gl = this.gl;
+      this.linked = false;
       this.pSprite = compile(gl, VS_SPRITE, FS_SPRITE);
       this.pBox = compile(gl, VS_BOX, FS_BOX);
       this.pLine = compile(gl, VS_LINE, FS_LINE);
@@ -300,15 +304,19 @@ void main() {
     // them (grid + camera glyph); perspective modes only.
     render(lines) {
       const gl = this.gl;
-      if (this.lost || gl.isContextLost()) return false;
+      if (this.lost || this.broken || gl.isContextLost()) return false;
+      if (!this.linked) {
+        try { for (const p of [this.pSprite, this.pBox, this.pLine, this.pComp]) link(gl, p); this.linked = true; }
+        catch (e) { console.warn("beatrig: WebGL2 preview off:", e); this.broken = true; return false; }
+      }
       const w = this.w, h = this.h, off = this.targets(w, h);
       gl.bindFramebuffer(gl.FRAMEBUFFER, off ? this.fbo.ms : null);
       gl.viewport(0, 0, w, h);
-      const bg = this.bg, a = this.amb;
-      gl.clearColor(bg[0] + a[0] * 0.006, bg[1] + a[1] * 0.006, bg[2] + a[2] * 0.006, 1);
-      gl.clearDepth(1);
+      const bg = this.bg, a = this.amb, cc = this.clearRGBA;
+      cc[0] = bg[0] + a[0] * 0.006; cc[1] = bg[1] + a[1] * 0.006; cc[2] = bg[2] + a[2] * 0.006; cc[3] = 1;
       gl.depthMask(true);
-      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.clearBufferfv(gl.COLOR, 0, cc);                 // typed-array clears: no boxed float arguments per frame
+      gl.clearBufferfv(gl.DEPTH, 0, this.clearZ);
       gl.disable(gl.CULL_FACE);
       // boxes: opaque, depth-tested and written
       if (this.nBoxes && !this.screen) {

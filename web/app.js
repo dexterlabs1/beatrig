@@ -1544,7 +1544,7 @@ function setView3(v) {
   lsSet(POPOUT ? "view3:popout" : "view3", v);
   document.querySelectorAll("#schem .tabs button").forEach((b) => b.classList.toggle("on", b.dataset.view === v));
   S.geo = null;
-  if (P3.r) { P3.dirty = true; P3.ovKey = ""; $("#schem-tip").hidden = true; hud3(); }
+  if (P3.r) { P3.dirty = true; P3.ovStale = true; $("#schem-tip").hidden = true; hud3(); }
   drawSchem();
 }
 function cycleView3() {
@@ -1579,7 +1579,7 @@ const GL = window.BeatrigGL;
 const glCv = $("#schem-gl"), ovCv = $("#schem-overlay"), meterCv = $("#schem-meters"), schemView = $("#schem-view");
 const KIND_OTHER = 0, KIND_LIGHT = 1, KIND_MESH = 2, KIND_FX = 3;
 const P3 = {
-  r: null, m: null, w: 0, h: 0, mw: 0, dpr: 1, lastF: -1, dirty: true, ovKey: "", meterKey: "", meterF: -1, domeG: null,
+  r: null, m: null, w: 0, h: 0, mw: 0, dpr: 1, lastF: -1, dirty: true, ovStale: true, meterStale: true, meterF: -1, meterRows: [], domeG: null,
   orbit: { yaw: 0, pitch: -30, dist: 2000, t: [0, 0, 0], user: false, scene: null },
   drag: false,
 };
@@ -1692,7 +1692,7 @@ function model3() {
   if (m && m.scene === S.scene && m.bake === S.bake) return m;
   P3.m = buildModel();
   if (!P3.orbit.user || P3.orbit.scene !== S.scene) { P3.orbit.user = false; frameOrbit(P3.m); }
-  P3.dirty = true; P3.ovKey = ""; P3.meterKey = ""; P3.domeG = null;
+  P3.dirty = true; P3.ovStale = true; P3.meterStale = true; P3.domeG = null;
   hud3();
   return P3.m;
 }
@@ -1767,6 +1767,7 @@ function setupCamera(m, mode) {
 }
 function draw3D(f, force) {
   const r = P3.r;
+  if (!S.bake) return false;                                         // nothing to draw before the first state
   if (!P3.w) sizeView3();
   const m = model3(), mode = S.view3;
   if (!force && !P3.dirty && f === P3.lastF) return false;
@@ -1782,7 +1783,7 @@ function draw3D(f, force) {
   }
   r.nGrid = m.nGrid;
   // lines: orbit draws the grid and the camera glyph, camera mode the grid only, dome none
-  r.render(empty ? 0 : mode === "orbit" ? 2 : mode === "camera" ? 1 : 0);
+  if (!r.render(empty ? 0 : mode === "orbit" ? 2 : mode === "camera" ? 1 : 0) && r.broken) { use2D(); drawSchem(); return false; }
   drawMeters(f);
   return true;
 }
@@ -1843,16 +1844,15 @@ function domeGeo3(m) {
 }
 // the 2D layer over the GL view: dome reticle and the empty-state note; redrawn only when the view changes
 function overlay3(m, mode, empty) {
-  const key = `${mode}|${P3.w}|${P3.h}|${P3.dpr}|${empty}|${m.n}|${!!S.scene}`;
-  if (key === P3.ovKey) return;
-  P3.ovKey = key;
+  if (!P3.ovStale) return;
+  P3.ovStale = false;
   const dpr = P3.dpr;
   ovCv.width = Math.round(P3.w * dpr); ovCv.height = Math.round(P3.h * dpr);
   const ctx = ovCv.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, P3.w, P3.h);
   const note = $("#schem-empty");
-  note.hidden = !empty;
+  note.hidden = !empty || !S.bake;                                  // nothing to say until the first state arrives
   if (empty) {
     note.querySelector("b").textContent = !S.scene ? "No scene.json" : !m.n ? "scene.json has no actor positions" : "scene.json has no camera";
     note.querySelector("span").textContent = !S.scene || !m.n ? "Scan reads actors, positions and the camera from the editor (it needs the live link)." : "Orbit shows the actors. Scan again once the level has a camera.";
@@ -1884,50 +1884,66 @@ function hud3() {
   glCv.classList.toggle("orbit", mode === "orbit");
   document.querySelectorAll("#schem .tabs button").forEach((b) => { if (b.dataset.view === "camera" || b.dataset.view === "dome") b.disabled = !cam; });
 }
-// One row per output under the view: channel bars (or true colours) at the playhead, and the value.
+// One row per output under the view: channel bars (or true colours) at the playhead, and the value. Row labels,
+// series keys and the colour-row pixels are prepared when the bake or the size changes; a value's text is rebuilt
+// only when the value changes.
+const meterRowCv = document.createElement("canvas"), meterRowCtx = meterRowCv.getContext("2d");
+let meterImg = null;
 function drawMeters(f) {
-  const outs = (S.bake && S.bake.outputs) || [];
-  const rows = Math.min(outs.length, 12), rowH = 18, H = rows ? rows * rowH + 8 : 0;
-  const key = `${P3.mw}|${H}|${P3.dpr}|${S.bakeId}`;
-  if (key === P3.meterKey && f === P3.meterF) return;
-  P3.meterF = f;
-  if (key !== P3.meterKey) {
-    P3.meterKey = key;
+  const outs = (S.bake && S.bake.outputs) || [], rowH = 18;
+  if (P3.meterStale) {
+    P3.meterStale = false;
+    P3.meterRows = outs.slice(0, 12).map((o) => ({
+      o, key: "o:" + o.id, n: o.channels.length, color: isColor(o), lo: o.min ?? 0, span: ((o.max ?? 1) - (o.min ?? 0)) || 1,
+      label: o.id.length > 14 ? o.id.slice(0, 13) + "…" : o.id, v: NaN, txt: "-",
+    }));
+    const rows = P3.meterRows.length, H = rows ? rows * rowH + 8 : 0, maxN = Math.max(1, ...P3.meterRows.map((r) => r.n));
     meterCv.style.height = H + "px";
     meterCv.hidden = !H;
     meterCv.width = Math.round(P3.mw * P3.dpr); meterCv.height = Math.round(H * P3.dpr);
+    if (!meterImg || meterImg.width < maxN) { meterRowCv.width = maxN; meterRowCv.height = 1; meterImg = meterRowCtx.createImageData(maxN, 1); }
+    P3.meterF = null;
   }
-  if (!H) return;
-  const ctx = meterCv.getContext("2d"), w = P3.mw;
+  const rows = P3.meterRows;
+  if (!rows.length || f === P3.meterF) return;
+  P3.meterF = f;
+  const H = rows.length * rowH + 8, ctx = meterCv.getContext("2d"), w = P3.mw, px = meterImg.data;
   ctx.setTransform(P3.dpr, 0, 0, P3.dpr, 0, 0);
   ctx.fillStyle = C.panel; ctx.fillRect(0, 0, w, H);
   ctx.font = F11; ctx.textBaseline = "middle";
-  const x0 = 96, x1 = w - 64;
-  for (let i = 0; i < rows; i++) {
-    const o = outs[i], y = 4 + i * rowH, mid = y + rowH / 2, s = S.series.get("o:" + o.id), n = o.channels.length;
+  const x0 = 96, bw = w - 64 - x0, hh = rowH - 6;
+  for (let i = 0; i < rows.length; i++) {
+    const R = rows[i], y = 4 + i * rowH, mid = y + rowH / 2, s = S.series.get(R.key), n = R.n;
+    const gap = n > 1 && bw / n > 4 ? 1 : 0, cw = (bw - gap * (n - 1)) / n;
     ctx.fillStyle = C.dim; ctx.textAlign = "left";
-    ctx.fillText(o.id.length > 14 ? o.id.slice(0, 13) + "…" : o.id, 12, mid);
-    const bw = x1 - x0, gap = n > 1 && bw / n > 4 ? 1 : 0, cw = (bw - gap * (n - 1)) / n, hh = rowH - 6;
-    if (isColor(o)) {
-      for (let c = 0; c < n; c++) {
-        if (s) { s.rgba(c, f, CB); ctx.fillStyle = rgbCss(toSRGB(CB[0], CB[1], CB[2], C8)); } else ctx.fillStyle = C.line;
-        ctx.fillRect(x0 + c * (cw + gap), y + 3, Math.max(1, cw), hh);
+    ctx.fillText(R.label, 12, mid);
+    if (R.color) {
+      // one pixel per channel, stretched into the cells in one draw; the gaps are painted over after
+      for (let c = 0, k = 0; c < n; c++, k += 4) {
+        if (s) { s.rgba(c, f, CB); toSRGB(CB[0], CB[1], CB[2], C8); px[k] = C8[0]; px[k + 1] = C8[1]; px[k + 2] = C8[2]; }
+        else { px[k] = px[k + 1] = px[k + 2] = 38; }
+        px[k + 3] = 255;
       }
+      meterRowCtx.putImageData(meterImg, 0, 0);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(meterRowCv, 0, 0, n, 1, x0, y + 3, bw, hh);
+      if (gap) { ctx.fillStyle = C.panel; for (let c = 1; c < n; c++) ctx.fillRect(Math.round(x0 + (c * bw) / n) - 1, y + 3, 1, hh); }
       ctx.fillStyle = C.faint; ctx.textAlign = "right"; ctx.fillText("colour", w - 12, mid);
       continue;
     }
-    const lo = o.min ?? 0, hi = o.max ?? 1, span = (hi - lo) || 1;
     let sum = 0;
     for (let c = 0; c < n; c++) {
-      const v = s ? s.at(c, f) : lo, b = clamp((v - lo) / span, 0, 1), xa = x0 + c * (cw + gap);
+      const v = s ? s.at(c, f) : R.lo, b = clamp((v - R.lo) / R.span, 0, 1), xa = x0 + c * (cw + gap);
       sum += v;
       ctx.fillStyle = C.line; ctx.fillRect(xa, y + 3, Math.max(1, cw), hh);
       ctx.fillStyle = C.accent;
       if (n > 1) { const bh = Math.max(b > 0 ? 1 : 0, Math.round(hh * b)); ctx.fillRect(xa, y + 3 + hh - bh, Math.max(1, cw), bh); }
       else ctx.fillRect(xa, y + 3, Math.round(cw * b), hh);
     }
+    const v = s ? sum / n : NaN;
+    if (v !== R.v && !(v !== v && R.v !== R.v)) { R.v = v; R.txt = s ? fmtVal(v) : "-"; }
     ctx.fillStyle = C.text; ctx.textAlign = "right";
-    ctx.fillText(s ? fmtVal(sum / n) : "-", w - 12, mid);
+    ctx.fillText(R.txt, w - 12, mid);
   }
   ctx.textAlign = "left";
 }
@@ -1937,7 +1953,7 @@ function sizeView3() {
   P3.mw = Math.max(1, Math.round($("#schem").getBoundingClientRect().width));
   P3.dpr = Math.min(window.devicePixelRatio || 1, 2);
   P3.r.resize(P3.w, P3.h, P3.dpr);
-  P3.dirty = true; P3.domeG = null;
+  P3.dirty = true; P3.domeG = null; P3.ovStale = true; P3.meterStale = true;
 }
 let schemRaf = 0;
 function requestSchem() {
@@ -2018,20 +2034,26 @@ function hover3(e) {
 function init3D() {
   const off = new URLSearchParams(location.search).get("gl") === "0";
   P3.r = GL && !off ? GL.create(glCv) : null;
-  const on = !!P3.r;
-  glCv.hidden = ovCv.hidden = !on;
-  $("#schem-hud").hidden = !on;
-  schem.hidden = on;
-  schemView.classList.toggle("gl", on);
-  if (!on) {
-    // the 2D views: ring (outputs as rings and bars), plan, dome
-    const spec = [["ring", "Ring", "Outputs as rings and bars (V cycles)"], ["plan", "Plan", "Top-down plan of the scanned actors"], ["dome", "Dome", "Domemaster seen from the scene camera"]];
-    document.querySelectorAll("#schem .tabs button").forEach((b, i) => { b.dataset.view = spec[i][0]; b.textContent = spec[i][1]; b.title = spec[i][2]; });
-    return;
-  }
+  if (!P3.r) return use2D();
+  glCv.hidden = ovCv.hidden = false;
+  $("#schem-hud").hidden = false;
+  schem.hidden = true;
+  schemView.classList.add("gl");
   P3.r.onrestore = () => { P3.m = null; requestSchem(); };
   attachOrbit();
-  new ResizeObserver(() => { sizeView3(); P3.ovKey = ""; P3.meterKey = ""; drawSchem(); }).observe(schemView);
+  new ResizeObserver(() => { sizeView3(); drawSchem(); }).observe(schemView);
+}
+// the 2D views (no WebGL2, ?gl=0, or shaders that failed to build): ring (outputs as rings and bars), plan, dome
+function use2D() {
+  const was = !!P3.r;
+  P3.r = null;
+  glCv.hidden = ovCv.hidden = meterCv.hidden = true;
+  $("#schem-hud").hidden = true; $("#schem-empty").hidden = true; $("#schem-tip").hidden = true;
+  schem.hidden = false;
+  schemView.classList.remove("gl");
+  const spec = [["ring", "Ring", "Outputs as rings and bars (V cycles)"], ["plan", "Plan", "Top-down plan of the scanned actors"], ["dome", "Dome", "Domemaster seen from the scene camera"]];
+  document.querySelectorAll("#schem .tabs button").forEach((b, i) => { b.dataset.view = spec[i][0]; b.textContent = spec[i][1]; b.title = spec[i][2]; b.disabled = false; });
+  if (was) setView3(S.view3 === "dome" ? "dome" : "ring");
 }
 const VIEWS_GL = ["orbit", "camera", "dome"], VIEWS_2D = ["ring", "plan", "dome"];
 
@@ -2917,7 +2939,7 @@ function setAway() {
   $("#schem-away").hidden = !away;
   schemView.classList.toggle("away", away);
   if (away) meterCv.hidden = true;
-  else { P3.meterKey = ""; P3.ovKey = ""; if (P3.r) sizeView3(); drawSchem(); }
+  else { P3.meterStale = true; P3.ovStale = true; if (P3.r) sizeView3(); drawSchem(); }
 }
 function initMainSync() {
   const btn = $("#popout");
@@ -3221,7 +3243,9 @@ async function boot() {
   for (const k of ["ruler", "sections", "wave"]) canvases.add(document.querySelector(`canvas[data-kind="${k}"]`));
   attachSeek(document.querySelector('canvas[data-kind="ruler"]'), true);
   attachSeek(document.querySelector('canvas[data-kind="wave"]'), true);
+  const t0 = performance.now(), first = api("/api/state");          // in flight while the 3D preview starts
   init3D();
+  S.perf.glInitMs = performance.now() - t0;
   setView3(lsGet(POPOUT ? "view3:popout" : "view3", "orbit"));
   $("#click").classList.toggle("on", Metro.on);
   $("#rec-replace").classList.toggle("on", !!lsGet("replace", false));
@@ -3229,8 +3253,7 @@ async function boot() {
   $("#live-seq").value = lsGet("sequence", "");
   if (!POPOUT) audio.src = "/api/audio";                            // the pop-out never plays sound
   try {
-    const t0 = performance.now();
-    const d = await api("/api/state");
+    const d = await first;
     S.perf.stateMs = performance.now() - t0;
     S.seenRev = d.rev;
     loadState(d, true);
@@ -3250,7 +3273,7 @@ async function boot() {
 // screen n times at the current view and reports per-kind costs; the perf table in TASKS.md comes from these.
 window.beatrigPerf = () => {
   const st = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return { n: a.length, p50: +s[s.length >> 1].toFixed(2), p95: +s[Math.floor(s.length * 0.95)].toFixed(2), max: +s[s.length - 1].toFixed(2) }; };
-  return { stateMs: S.perf.stateMs && +S.perf.stateMs.toFixed(1), dataReadyMs: S.perf.dataReady && +S.perf.dataReady.toFixed(0), firstPaintMs: S.perf.firstPaint && +S.perf.firstPaint.toFixed(0), flush: st(S.perf.flush), tick: st(S.perf.tick), schem: st(S.perf.schem), drawn: S.perf.drawn, skipped: S.perf.skipped };
+  return { glInitMs: S.perf.glInitMs != null ? +S.perf.glInitMs.toFixed(1) : null, stateMs: S.perf.stateMs && +S.perf.stateMs.toFixed(1), dataReadyMs: S.perf.dataReady && +S.perf.dataReady.toFixed(0), firstPaintMs: S.perf.firstPaint && +S.perf.firstPaint.toFixed(0), flush: st(S.perf.flush), tick: st(S.perf.tick), schem: st(S.perf.schem), drawn: S.perf.drawn, skipped: S.perf.skipped };
 };
 window.beatrigBench = (n = 20) => {
   const vr = timeline.getBoundingClientRect(), kinds = {}, all = [];
