@@ -26,7 +26,12 @@ def cmd_analyze(a):
     bpms = ", ".join(f"{b['bpm']} @ {b['time']:.2f}s" for b in m["bpm_map"])
     print(f"bpm       {bpms}" + ("  (LOW CONFIDENCE: no proven pulse)" if m["fallback"] else ""))
     print(f"grid      offset {m['grid_offset']:.3f} s")
-    print(f"beats     {len(m['beats'])}")
+    print(f"beats     {len(m['beats'])} from the {an.tracker_label()}")
+    bars = an.bars_summary()
+    if bars:
+        print(f"bars      {bars['meter']} beats per bar, {bars['bars']} bars, first downbeat {bars['first_downbeat']:.3f} s "
+              f"(confidence {bars['confidence']})")
+    print(f"stems     stem features read {an.stems_label()}")
     print(f"pulse     {m['pulse']['label']} (confidence {m['pulse']['confidence']})")
     for p in m["passages"]:
         print(f"  passage {p['start']:.2f}-{p['end']:.2f}s {p['bpm']} bpm conf {p['confidence']} hit {p['hit_rate']} jitter {p['jitter']} agree {p['agree']} vs {p['chance']}")
@@ -78,8 +83,8 @@ def cmd_notes_init(a):
     an = analyze(rig)
     ctx = make_ctx(rig, an, notes)
     src, _, nid = (a.source or "").partition(":")
-    if a.min_conf is not None and src != "beats":
-        print("--min-conf applies to --from beats", file=sys.stderr)
+    if a.min_conf is not None and src not in ("beats", "downbeats"):
+        print("--min-conf applies to --from beats or downbeats", file=sys.stderr)
         return 2
     if src == "onsets":
         node = rig.node(nid)
@@ -87,11 +92,13 @@ def cmd_notes_init(a):
             print(f"--from onsets:<node> needs an onsets node id, got {nid!r}", file=sys.stderr)
             return 2
         times, vels = detect_onsets(node, ctx, rig.nodes)
-    elif src == "beats":
-        node = rig.node(nid) if nid else {"id": "_beats", "op": "beats"}
+    elif src in ("beats", "downbeats"):
+        node = rig.node(nid) if nid and src == "beats" else {"id": "_beats", "op": "beats"}
         if node is None or node.get("op") != "beats":
             print(f"--from beats:<node> needs a beats node id, got {nid!r}", file=sys.stderr)
             return 2
+        if src == "downbeats":                               # bar lines: every meter-th beat on the bar grid
+            node = dict(node, every=int(((an.meta.get("bars") or {}) if an else {}).get("meter") or 4), anchor="bar")
         if a.min_conf is not None:
             if not 0 <= a.min_conf <= 1:
                 print("--min-conf must be within 0..1", file=sys.stderr)
@@ -99,7 +106,7 @@ def cmd_notes_init(a):
             node = dict(node, min_confidence=a.min_conf)
         times, vels = beat_times(node, ctx)
     else:
-        print("--from must be onsets:<node> or beats[:<node>]", file=sys.stderr)
+        print("--from must be onsets:<node>, beats[:<node>] or downbeats", file=sys.stderr)
         return 2
     if not notes["bpm_map"] and an is not None:
         notes["bpm_map"] = an.bpm_map
@@ -329,7 +336,7 @@ def main(argv=None):
     p = ns.add_parser("init", help="fill a track from detected onsets or beats")
     p.add_argument("rig")
     p.add_argument("--track")
-    p.add_argument("--from", dest="source", help="onsets:<node> | beats[:<node>]")
+    p.add_argument("--from", dest="source", help="onsets:<node> | beats[:<node>] | downbeats (bar lines)")
     p.add_argument("--min-conf", type=float, default=None,
                    help="beats: keep only beats whose analysis confidence is at least this (0..1)")
     p.set_defaults(fn=cmd_notes_init)

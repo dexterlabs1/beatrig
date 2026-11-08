@@ -169,18 +169,34 @@ def op_onsets(node, ins, ctx):
     return hits_signal(ctx.frame_of(times), vels, ctx)
 
 
+def beat_numbers(a, ctx, bt):
+    """(beat number per beat, meter) on the bar grid: n = bar * meter + pos from the analysis' downbeats when it has
+    them (a beat without an onset keeps its number, so counting never slips), else the tempo map's beat count from
+    the grid offset (bars of 4)"""
+    bars = (getattr(a, "meta", None) or {}).get("bars") or {}
+    meter = int(bars.get("meter") or 4)
+    if len(a.beats) and all("bar" in b and "pos" in b for b in a.beats):
+        return np.array([b["bar"] * meter + b["pos"] for b in a.beats], np.int64), meter
+    return np.round(ctx.tempo.beats_at(np.asarray(bt, np.float64))).astype(np.int64), meter
+
+
 def beat_times(node, ctx):
     """verified beats (analysis), every/offset picking, causal subdivision (spacing from the PREVIOUS interval, only
     up to the next real beat). v0.3: min_confidence drops beats (and their subdivisions) whose analysis confidence is
     below it, after every/offset have counted the full grid; velocity "confidence" uses that confidence as the hit
-    velocity instead of the onset strength (subdivisions keep the 0.6 factor)."""
+    velocity instead of the onset strength (subdivisions keep the 0.6 factor).
+    anchor "first" (default) counts every/offset along the beat list from its first beat. anchor "bar" counts on the
+    bar grid: beat number n (n % meter == 0 on a downbeat; subdivision j of beat n is n * subdivide + j) is kept when
+    (n - offset) % every == 0, so every 4 = the downbeats and offset is a phase within the bar, not a skip."""
     a = ctx.need_analysis(node)
     bt = np.array([b["time"] for b in a.beats])
     vel_key = "confidence" if P(node, "velocity") == "confidence" else "strength"
     bv = np.array([b.get(vel_key, 1.0) for b in a.beats])
     bc = np.array([b.get("confidence", 1.0) for b in a.beats])
     every, off, sub = int(P(node, "every")), int(P(node, "offset")), int(P(node, "subdivide"))
-    times, vels, confs = list(bt), list(bv), list(bc)
+    by_bar = P(node, "anchor") == "bar"
+    num = beat_numbers(a, ctx, bt)[0] * max(1, sub) if by_bar and len(bt) else np.zeros(len(bt), np.int64)
+    times, vels, confs, nums = list(bt), list(bv), list(bc), list(num)
     if sub > 1 and len(bt) > 2:
         T = 60.0 / np.array([ctx.tempo.bpm_at(t) for t in bt])
         for i in range(1, len(bt)):
@@ -194,10 +210,14 @@ def beat_times(node, ctx):
                     times.append(t)
                     vels.append(bv[i] * 0.6)
                     confs.append(bc[i])
+                    nums.append(num[i] + j)
         o = np.argsort(times, kind="stable")
-        times, vels, confs = np.array(times)[o], np.array(vels)[o], np.array(confs)[o]
-    times, vels, confs = np.asarray(times), np.asarray(vels), np.asarray(confs)
-    if every > 1 or off:
+        times, vels, confs, nums = np.array(times)[o], np.array(vels)[o], np.array(confs)[o], np.array(nums)[o]
+    times, vels, confs, nums = np.asarray(times), np.asarray(vels), np.asarray(confs), np.asarray(nums, np.int64)
+    if by_bar and (every > 1 or off):
+        sel = (nums - off) % max(1, every) == 0
+        times, vels, confs = times[sel], vels[sel], confs[sel]
+    elif every > 1 or off:
         sel = np.arange(len(times))
         sel = sel[(sel - off) % every == 0] if every > 1 else sel[off:]
         sel = sel[sel >= off]
@@ -209,8 +229,8 @@ def beat_times(node, ctx):
     return times, vels
 
 
-@op("beats", {"every": 1, "offset": 0, "subdivide": 1, "min_confidence": 0.0, "velocity": "strength"}, inputs=None,
-    kind="trigger", chans=lambda n, c: 1)
+@op("beats", {"every": 1, "offset": 0, "subdivide": 1, "min_confidence": 0.0, "velocity": "strength", "anchor": "first"},
+    inputs=None, kind="trigger", chans=lambda n, c: 1)
 def op_beats(node, ins, ctx):
     times, vels = beat_times(node, ctx)
     return hits_signal(ctx.frame_of(times), vels, ctx)

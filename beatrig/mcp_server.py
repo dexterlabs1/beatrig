@@ -275,6 +275,7 @@ def analyze(rig_path: str) -> str:
         "bpm": m["bpm_map"][0]["bpm"] if m.get("bpm_map") else None, "bpm_map": m.get("bpm_map"),
         "grid_offset_s": _r(m.get("grid_offset")), "beats": len(m.get("beats") or []),
         "pulse": m.get("pulse"), "low_confidence_tempo": bool(m.get("fallback")),
+        "beat_tracker": a.tracker_label(), "bars": a.bars_summary(), "stems": a.stems_label(),
         "passages": [{k: p_.get(k) for k in ("start", "end", "bpm", "confidence")} for p_ in m.get("passages") or []][:12],
         "cache": "hit" if a.loaded_from_cache else "built",
         "suggested_bands": [b["band"] for b in good][:3],
@@ -511,8 +512,9 @@ def get_notes(rig_path: str, track: str | None = None, start_s: float = 0.0, end
 @tool
 def notes_init(rig_path: str, track: str, source: str, threshold: float | None = None, replace: bool = False) -> str:
     """Fill a notes track from the audio. source: "band:LO-HI" (onsets in that Hz range, e.g. "band:40-120"),
-    "onsets:<node id>", "beats" (the verified beat grid) or "beats:<node id>". Refuses to overwrite an existing track
-    unless replace=true. Seeds the notes tempo map from the analysis if it has none."""
+    "onsets:<node id>", "beats" (the verified beat grid), "beats:<node id>" or "downbeats" (the bar lines, when the
+    analysis knows them; else every 4th beat of the tempo map). Refuses to overwrite an existing track unless
+    replace=true. Seeds the notes tempo map from the analysis if it has none."""
     from .bake import make_ctx
     from .ops import beat_times, detect_onsets
     p, data, rig = _load(rig_path)
@@ -538,8 +540,10 @@ def notes_init(rig_path: str, track: str, source: str, threshold: float | None =
         node = rig.node(arg) if arg else {"id": "_beats", "op": "beats"}
         if node is None or node.get("op") != "beats":
             raise ToolFailure(f"beats:<id> needs a beats node id, got {arg!r}")
+    elif kind == "downbeats":
+        node = {"id": "_downbeats", "op": "beats", "every": int((a.meta.get("bars") or {}).get("meter") or 4), "anchor": "bar"}
     else:
-        raise ToolFailure('source must be "band:LO-HI", "onsets:<node>", "beats" or "beats:<node>"')
+        raise ToolFailure('source must be "band:LO-HI", "onsets:<node>", "beats", "beats:<node>" or "downbeats"')
     if threshold is not None and node.get("op") == "onsets":
         node = dict(node, threshold=float(threshold))
     if node["op"] == "onsets":
