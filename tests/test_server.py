@@ -167,3 +167,33 @@ def test_pattern_placements_bake_like_their_hits():
         assert d2["notes"]["tracks"]["kick"][0] == {"pattern": "k4", "at_beat": 0, "repeat": 1}   # kept as a placement
     finally:
         s.close()
+
+
+def get_full(port, path):
+    """(status, content type, body) for a GET"""
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    c.request("GET", path)
+    r = c.getresponse()
+    out = (r.status, r.getheader("Content-Type") or "", r.read())
+    c.close()
+    return out
+
+
+def test_page_files_are_served_and_packaged():
+    """every script and stylesheet the page loads is served with its type and is in the wheel (pyproject force-include)"""
+    import re
+    s = Server()
+    try:
+        st, ctype, html = get_full(s.port, "/")
+        assert st == 200 and ctype.startswith("text/html")
+        refs = re.findall(r'(?:src|href)="([\w.-]+\.(?:js|css))"', html.decode("utf-8"))
+        assert {"app.js", "app.css", "preview3d.js"} <= set(refs)
+        for ref in refs:
+            st, ctype, body = get_full(s.port, "/" + ref)
+            assert st == 200 and body
+            assert ctype.startswith("text/javascript" if ref.endswith(".js") else "text/css"), (ref, ctype)
+    finally:
+        s.close()
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    for ref in refs + ["index.html"]:
+        assert f'"web/{ref}" = "beatrig/_web/{ref}"' in pyproject, f"{ref} is not packaged in the wheel"

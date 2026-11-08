@@ -49,6 +49,7 @@ exclude = ["web/dev", "**/*.wav", "**/analysis.*", "**/bake.json"]
 "web/index.html" = "beatrig/_web/index.html"
 "web/app.css" = "beatrig/_web/app.css"
 "web/app.js" = "beatrig/_web/app.js"
+"web/preview3d.js" = "beatrig/_web/preview3d.js"
 "ue" = "beatrig/_ue"
 
 [tool.hatch.build.targets.sdist]

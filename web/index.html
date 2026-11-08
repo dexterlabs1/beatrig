@@ -108,12 +108,18 @@
   <section id="schem">
     <h2><span class="ttl">Preview <small id="schem-frame" class="dim"></small></span>
       <span class="tabs" role="tablist">
-        <button data-view="ring" class="on" title="Outputs as rings and bars (V cycles)">Ring</button><button data-view="plan" title="Top-down plan of the scanned actors">Plan</button><button data-view="dome" title="Domemaster seen from the scene camera">Dome</button>
+        <button data-view="orbit" class="on" title="Orbit the scene: drag to turn, right-drag or Shift+drag to pan, wheel to zoom, double-click to frame (V cycles)">Orbit</button><button data-view="camera" title="Look through the scene camera (its forward axis)">Camera</button><button data-view="dome" title="Domemaster seen from the scene camera">Dome</button>
       </span>
     </h2>
     <div id="schem-view">
       <canvas id="schem-canvas"></canvas>
+      <canvas id="schem-gl" hidden></canvas>
+      <canvas id="schem-overlay" hidden></canvas>
+      <div id="schem-hud" hidden><small id="schem-label"></small><button id="schem-fit" title="Frame the driven actors (or double-click the view)" hidden>Frame</button></div>
+      <div id="schem-empty" class="empty" hidden><b></b><span></span></div>
+      <div id="schem-tip" hidden></div>
     </div>
+    <canvas id="schem-meters" hidden></canvas>
     <div id="scene-bar"><small id="scene-info" class="dim">no scene.json</small><button id="scan" title="Read actors, positions, components and the camera from the editor (needs the live link)">Scan</button></div>
   </section>
   <section id="params">
@@ -155,13 +161,14 @@
     <dt><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Shift</kbd></dt><dd>undo, redo</dd>
     <dt><kbd>=</kbd> <kbd>-</kbd> <kbd>\</kbd></dt><dd>zoom in, out, fit</dd>
     <dt><kbd>F</kbd></dt><dd>follow the playhead</dd>
-    <dt><kbd>V</kbd></dt><dd>preview: ring, plan, dome</dd>
+    <dt><kbd>V</kbd></dt><dd>preview: orbit, camera, dome (without WebGL2: ring, plan, dome)</dd>
     <dt><kbd>Home</kbd></dt><dd>back to the start</dd>
     <dt><kbd>Ctrl</kbd>+<kbd>S</kbd></dt><dd>save</dd>
   </dl>
 </div>
 
 <audio id="audio" preload="metadata"></audio>
+<script src="preview3d.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -246,6 +246,22 @@ button.flashes:hover:not(:disabled) { background: rgba(216, 105, 91, 0.12); bord
 #schem { border-bottom: 1px solid var(--line); flex: 0 0 auto; display: flex; flex-direction: column; }
 #schem-view { position: relative; background: var(--bg); }
 #schem-canvas { display: block; width: 100%; background: var(--bg); }
+#schem-view.gl { aspect-ratio: 4 / 3; overflow: hidden; }
+#schem-gl, #schem-overlay { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+#schem-overlay { pointer-events: none; }
+#schem-gl.orbit { cursor: grab; }
+#schem-gl.dragging { cursor: grabbing; }
+#schem-hud { position: absolute; left: 8px; right: 8px; top: 6px; display: flex; justify-content: space-between; align-items: center; gap: 8px; pointer-events: none; }
+#schem-label { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#schem-hud button { pointer-events: auto; height: 20px; padding: 0 8px; font-size: 11px; color: var(--text-2); }
+#schem-empty { position: absolute; inset: 0; pointer-events: none; }
+#schem-empty span { color: var(--dim); max-width: 280px; }
+#schem-tip {
+  position: absolute; z-index: 2; pointer-events: none; white-space: pre; font-size: 11px; line-height: 16px;
+  color: var(--text-2); background: var(--surface); border: 1px solid var(--line-2); border-radius: 3px; padding: 4px 8px;
+}
+#schem-tip::first-line { color: var(--text); font-weight: 600; }
+#schem-meters { display: block; width: 100%; border-top: 1px solid var(--line); }
 #scene-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 8px 4px 12px; border-top: 1px solid var(--line); }
 #scene-bar small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #scene-bar button { height: 20px; padding: 0 8px; }

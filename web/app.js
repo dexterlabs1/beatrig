@@ -56,7 +56,7 @@ const S = {
   tempo: null, ptempo: null, ops: null,
   keymap: {}, hoverTrack: null, take: null, playStartT: 0, pausedT: 0, audioStale: false,
   undo: [], redo: [],
-  view3: "ring", geo: null, actorMap: new Map(),
+  view3: "orbit", geo: null, actorMap: new Map(), schemF: null,
   link: false, lastPagePush: 0,
   perf: { flush: [], tick: [], schem: [], maxFlush: 0, drawn: 0, skipped: 0, stateMs: null, firstPaint: null },
 };
@@ -1343,17 +1343,22 @@ function schemHeight() {
   for (const o of (S.bake && S.bake.outputs) || []) h += o.channels.some((c) => c.actor) && (o.target || {}).kind !== "transform" ? 150 : 26;
   return Math.max(60, h + 4);
 }
-function drawSchem() {
+const schemFrameEl = $("#schem-frame");
+// The preview at the playhead: the WebGL2 scene when the browser has it, else the 2D views. force = false (playback,
+// seeks) skips the redraw when the frame and the view haven't changed.
+function drawSchem(force = true) {
   const t0 = performance.now();
   const f = frameOf(curT());
-  const fr = $("#schem-frame"), ft = `frame ${f}`;
-  if (fr.textContent !== ft) fr.textContent = ft;
-  const want = schemHeight() + "px";
-  if (schem.style.height !== want) { schem.style.height = want; S.geo = null; }
-  const { ctx, w, h } = setupCanvas(schem);
-  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, w, h);
-  if (S.view3 === "ring") drawRing(ctx, w, f);
-  else drawSpace(ctx, w, h, f, S.view3);
+  if (f !== S.schemF) { S.schemF = f; schemFrameEl.textContent = `frame ${f}`; }
+  if (P3.r) { if (!draw3D(f, force)) return; }
+  else {
+    const want = schemHeight() + "px";
+    if (schem.style.height !== want) { schem.style.height = want; S.geo = null; }
+    const { ctx, w, h } = setupCanvas(schem);
+    ctx.fillStyle = C.bg; ctx.fillRect(0, 0, w, h);
+    if (S.view3 === "ring") drawRing(ctx, w, f);
+    else drawSpace(ctx, w, h, f, S.view3);
+  }
   perfPush(S.perf.schem, performance.now() - t0);
 }
 function drawRing(ctx, w, f) {
@@ -1432,15 +1437,22 @@ function domeAxes(cam) {
 }
 // Equidistant fisheye: radius proportional to the angle from the centre axis, the circle's edge at dome_angle / 2.
 // Returns [x, y] in -1..1 units of the circle radius, or null when the point is outside the dome.
-function domeProject(loc, cam, ax, half) {
-  const d = [loc[0] - cam.location[0], loc[1] - cam.location[1], loc[2] - cam.location[2]];
-  const len = Math.hypot(d[0], d[1], d[2]);
-  if (len < 1e-6) return null;
-  const x = dot(d, ax.x) / len, y = dot(d, ax.y) / len, z = dot(d, ax.c) / len;
+// domeProjectTo writes into out (no allocation, for the 3D view's frame loop); domeProject returns a new pair.
+function domeProjectTo(lx, ly, lz, cam, ax, half, out) {
+  const d0 = lx - cam.location[0], d1 = ly - cam.location[1], d2 = lz - cam.location[2];
+  const len = Math.hypot(d0, d1, d2);
+  if (len < 1e-6) return false;
+  const x = (d0 * ax.x[0] + d1 * ax.x[1] + d2 * ax.x[2]) / len, y = (d0 * ax.y[0] + d1 * ax.y[1] + d2 * ax.y[2]) / len;
+  const z = (d0 * ax.c[0] + d1 * ax.c[1] + d2 * ax.c[2]) / len;
   const theta = Math.acos(clamp(z, -1, 1));
-  if (theta > half + 1e-9) return null;
+  if (theta > half + 1e-9) return false;
   const rr = theta / half, q = Math.hypot(x, y) || 1;
-  return [rr * x / q, rr * y / q];
+  out[0] = rr * x / q; out[1] = rr * y / q;
+  return true;
+}
+function domeProject(loc, cam, ax, half) {
+  const out = [0, 0];
+  return domeProjectTo(loc[0], loc[1], loc[2], cam, ax, half, out) ? out : null;
 }
 function sceneGeo(w, h, mode) {
   const g = S.geo;
@@ -1520,12 +1532,23 @@ function drawSpace(ctx, w, h, f, mode) {
   }
   ctx.fillStyle = C.faint; ctx.fillText(g.label || "", 8, 10);
 }
+// preview mode: orbit / camera / dome with WebGL2, ring / plan / dome without (an old stored mode maps to the first)
 function setView3(v) {
+  const views = P3.r ? VIEWS_GL : VIEWS_2D;
+  if (!views.includes(v)) v = views[0];
   S.view3 = v;
   lsSet("view3", v);
   document.querySelectorAll("#schem .tabs button").forEach((b) => b.classList.toggle("on", b.dataset.view === v));
   S.geo = null;
+  if (P3.r) { P3.dirty = true; P3.ovKey = ""; $("#schem-tip").hidden = true; hud3(); }
   drawSchem();
+}
+function cycleView3() {
+  const views = P3.r ? VIEWS_GL : VIEWS_2D;
+  for (let k = 1; k <= views.length; k++) {
+    const v = views[(views.indexOf(S.view3) + k) % views.length], b = document.querySelector(`#schem .tabs button[data-view="${v}"]`);
+    if (b && !b.disabled) return setView3(v);
+  }
 }
 document.querySelectorAll("#schem .tabs button").forEach((b) => { b.onclick = () => setView3(b.dataset.view); });
 function sceneInfo() {
@@ -1540,6 +1563,473 @@ function sceneInfo() {
   dl.textContent = "";
   for (const s of (sc && sc.sequences) || []) { const o = document.createElement("option"); o.value = s; dl.append(o); }
 }
+
+// ------------------------------------------------------------------------------------------- preview: 3D (WebGL2)
+// Every scene.json actor an output drives, at its real position: lights as glow sprites with a pool of light on the
+// floor, material/Niagara-driven meshes as boxes that glow, transform outputs moving, turning and scaling them, MPC
+// outputs as an ambient tint. Brightness and colour are the baked values at the playhead frame (no interpolation).
+// Modes: orbit (drag, right/Shift-drag, wheel, double-click frames), camera (through scene.camera) and dome (the
+// domemaster, placed with domeProjectTo: the same projection the 2D dome view uses). The model is rebuilt when the
+// scene or the bake changes; the per-frame path writes into preallocated arrays and allocates nothing.
+const GL = window.BeatrigGL;
+const glCv = $("#schem-gl"), ovCv = $("#schem-overlay"), meterCv = $("#schem-meters"), schemView = $("#schem-view");
+const KIND_OTHER = 0, KIND_LIGHT = 1, KIND_MESH = 2, KIND_FX = 3;
+const P3 = {
+  r: null, m: null, w: 0, h: 0, mw: 0, dpr: 1, lastF: -1, dirty: true, ovKey: "", meterKey: "", meterF: -1, domeG: null,
+  orbit: { yaw: 0, pitch: -30, dist: 2000, t: [0, 0, 0], user: false, scene: null },
+  drag: false,
+};
+const VFOV = 40 * Math.PI / 180;
+const F3 = new Float32Array(3), R3 = new Float32Array(3), U3 = new Float32Array(3), EYE = new Float32Array(3), PXY = new Float32Array(2);
+const AXIS = { x: 0, y: 1, z: 2 }, ROT_AXIS = { pitch: 0, yaw: 1, roll: 2, y: 0, z: 1, x: 2 };   // scene rotation = [pitch, yaw, roll]
+function gridStep(v) { for (const s of [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000]) if (s >= v) return s; return 100000; }
+
+function buildModel() {
+  const sc = S.scene, actors = (sc && sc.actors) || {}, cam = sc && sc.camera && Array.isArray(sc.camera.location) ? sc.camera : null;
+  const names = [], kinds = [], base = [], rot0 = [], idx = new Map();
+  for (const a of Object.keys(actors)) {
+    const A = actors[a];
+    if (!Array.isArray(A.location) || (cam && a === cam.actor)) continue;
+    const ks = new Set((A.components || []).map((c) => c.kind));
+    idx.set(a, names.length); names.push(a);
+    kinds.push(ks.has("light") ? KIND_LIGHT : ks.has("niagara") ? KIND_FX : ks.has("mesh") ? KIND_MESH : KIND_OTHER);
+    base.push(+A.location[0] || 0, +A.location[1] || 0, +A.location[2] || 0);
+    const r = A.rotation || [0, 0, 0];
+    rot0.push(+r[0] || 0, +r[1] || 0, +r[2] || 0);
+  }
+  const n = names.length;
+  const m = {
+    scene: sc, bake: S.bake, cam, names, idx, n, kind: Uint8Array.from(kinds), base: Float32Array.from(base), rot0: Float32Array.from(rot0),
+    bri: names.map(() => []), col: names.map(() => []), xf: names.map(() => []), outs: names.map(() => []),
+    mpcS: [], mpcC: [], driven: new Uint8Array(n),
+    b: new Float32Array(n), rgb: new Float32Array(n * 3), pos: new Float32Array(n * 3), rot: new Float32Array(n * 3), scl: new Float32Array(n * 3),
+    tint: new Float32Array(3), amb: 0,
+  };
+  for (const o of (S.bake && S.bake.outputs) || []) {
+    const t = o.target || {}, col = isColor(o), key = "o:" + o.id, lo = o.min ?? 0, hi = o.max ?? 1, span = (hi - lo) || 1;
+    if (t.kind === "mpc") { (col ? m.mpcC : m.mpcS).push({ key, lo, span }); continue; }
+    o.channels.forEach((ch, c) => {
+      const i = idx.get(ch.actor);
+      if (i == null) return;
+      m.outs[i].push({ o, c });
+      if (t.kind === "transform") {
+        const prop = { location: 0, rotation: 1, scale: 2 }[t.property], ax = (prop === 1 ? ROT_AXIS : AXIS)[String(t.axis || "").toLowerCase()];
+        if (!col && prop != null && ax != null) m.xf[i].push({ key, c, prop, ax, add: t.additive !== false });
+        return;
+      }
+      if (col) m.col[i].push({ key, c });
+      else if ((t.kind === "light" && (t.property || "intensity") === "intensity") || t.kind === "material" || t.kind === "niagara") m.bri[i].push({ key, c, lo, span });
+    });
+  }
+  // framing: the driven actors (all of them when nothing is driven) and the camera
+  for (let i = 0; i < n; i++) m.driven[i] = m.bri[i].length || m.col[i].length || m.xf[i].length ? 1 : 0;
+  const anyDriven = m.driven.some((d) => d), fit = [];
+  for (let i = 0; i < n; i++) if (m.driven[i] || !anyDriven) fit.push([base[i * 3], base[i * 3 + 1], base[i * 3 + 2]]);
+  if (cam) fit.push(cam.location.map((v) => +v || 0));
+  let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (const p of fit) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], p[k]); hi[k] = Math.max(hi[k], p[k]); }
+  if (!fit.length) { lo = [-500, -500, 0]; hi = [500, 500, 0]; }
+  m.centre = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
+  m.radius = 100;
+  for (const p of fit) m.radius = Math.max(m.radius, Math.hypot(p[0] - m.centre[0], p[1] - m.centre[1], p[2] - m.centre[2]));
+  m.unit = clamp(m.radius * 0.03, 6, 400);
+  m.floorZ = lo[2];
+  for (let i = 0; i < n; i++) m.floorZ = Math.min(m.floorZ, base[i * 3 + 2]);
+  m.nDriven = 0;
+  for (let i = 0; i < n; i++) m.nDriven += m.driven[i];
+  if (cam) { m.domeAx = domeAxes(cam); m.domeAngle = clamp(+cam.dome_angle || 180, 10, 360); }
+  P3.r.reserve(n * 3 + 8, n + 4, n + 4);
+  P3.r.setLines(sceneLines(m));
+  return m;
+}
+// ground grid (fading out from the framed centre) + the scene camera glyph, as one static line buffer
+function sceneLines(m) {
+  const L = [], step = gridStep(m.radius / 5), half = Math.ceil(m.radius * 1.5 / step) * step, z = m.floorZ;
+  const cx = Math.round(m.centre[0] / step) * step, cy = Math.round(m.centre[1] / step) * step;
+  const push = (x0, y0, z0, x1, y1, z1, c, a) => L.push(x0, y0, z0, c, c, c, a, x1, y1, z1, c, c, c, a);
+  for (let k = -half; k <= half + 1e-6; k += step) {
+    const major = Math.abs(Math.round((cx + k) / step)) % 5 === 0, origin = Math.abs(cx + k) < 1e-6;
+    push(cx + k, cy - half, z, cx + k, cy + half, z, 0.014, origin ? 2.6 : major ? 1.8 : 1);
+  }
+  for (let k = -half; k <= half + 1e-6; k += step) {
+    const major = Math.abs(Math.round((cy + k) / step)) % 5 === 0, origin = Math.abs(cy + k) < 1e-6;
+    push(cx - half, cy + k, z, cx + half, cy + k, z, 0.014, origin ? 2.6 : major ? 1.8 : 1);
+  }
+  m.nGrid = L.length / GL.LINE_FLOATS;
+  m.gridFade = [cx, cy, half];
+  const cam = m.cam;
+  if (cam) {
+    const b = rotBasis(cam.rotation), e = cam.location.map((v) => +v || 0), s = m.unit * 3, c = 0.06;
+    const P = (f, r, u) => [e[0] + b.F[0] * f + b.R[0] * r + b.U[0] * u, e[1] + b.F[1] * f + b.R[1] * r + b.U[1] * u, e[2] + b.F[2] * f + b.R[2] * r + b.U[2] * u];
+    const seg = (p, q) => push(p[0], p[1], p[2], q[0], q[1], q[2], c, 1);
+    if (String(cam.projection || "").startsWith("dome")) {
+      // dome camera: its rim (the horizon of the fisheye), the zenith (actor up) and the front (actor forward)
+      for (let i = 0; i < 32; i++) {
+        const a0 = (i / 32) * Math.PI * 2, a1 = ((i + 1) / 32) * Math.PI * 2;
+        seg(P(Math.cos(a0) * s, Math.sin(a0) * s, 0), P(Math.cos(a1) * s, Math.sin(a1) * s, 0));
+      }
+      seg(P(0, 0, 0), P(0, 0, s * 1.4)); seg(P(0, 0, 0), P(s * 1.6, 0, 0));
+    } else {
+      const d = s * 1.6, w = s * 0.8, hh = s * 0.5, k = [P(d, -w, hh), P(d, w, hh), P(d, w, -hh), P(d, -w, -hh)];
+      for (let i = 0; i < 4; i++) { seg(P(0, 0, 0), k[i]); seg(k[i], k[(i + 1) % 4]); }
+    }
+  }
+  return new Float32Array(L);
+}
+function frameOrbit(m) {
+  const o = P3.orbit, aspect = P3.w / Math.max(1, P3.h) || 4 / 3;
+  const half = Math.min(VFOV, 2 * Math.atan(Math.tan(VFOV / 2) * aspect)) / 2;
+  o.t = m.centre.slice();
+  o.dist = m.radius / Math.sin(half) * 0.95;
+  o.scene = m.scene;
+}
+function model3() {
+  const m = P3.m;
+  if (m && m.scene === S.scene && m.bake === S.bake) return m;
+  P3.m = buildModel();
+  if (!P3.orbit.user || P3.orbit.scene !== S.scene) { P3.orbit.user = false; frameOrbit(P3.m); }
+  P3.dirty = true; P3.ovKey = ""; P3.meterKey = ""; P3.domeG = null;
+  hud3();
+  return P3.m;
+}
+// the baked values of every actor at frame f -> m.b (brightness 0..1, -1 = not driven), m.rgb (linear, scaled by
+// brightness), m.pos / m.rot / m.scl (with transform outputs applied); MPC outputs -> m.amb, m.tint
+function evalModel(m, f) {
+  for (let i = 0, j = 0; i < m.n; i++, j += 3) {
+    const B = m.bri[i], Cl = m.col[i], X = m.xf[i];
+    let b = -1;
+    for (let k = 0; k < B.length; k++) {
+      const e = B[k], s = S.series.get(e.key);
+      if (!s) continue;
+      const v = (s.at(e.c, f) - e.lo) / e.span;
+      if (v > b) b = v < 0 ? 0 : v > 1 ? 1 : v;
+    }
+    let r = C.warm[0], g = C.warm[1], bl = C.warm[2], got = false;
+    for (let k = 0; k < Cl.length; k++) {
+      const s = S.series.get(Cl[k].key);
+      if (!s) continue;
+      s.rgba(Cl[k].c, f, CB); r = CB[0] > 0 ? CB[0] : 0; g = CB[1] > 0 ? CB[1] : 0; bl = CB[2] > 0 ? CB[2] : 0; got = true; break;
+    }
+    if (b < 0 && !got) { m.b[i] = X.length ? 0 : -1; m.rgb[j] = m.rgb[j + 1] = m.rgb[j + 2] = 0; }
+    else { const k = b < 0 ? 1 : 0.04 + 0.96 * b; m.b[i] = b < 0 ? 1 : b; m.rgb[j] = r * k; m.rgb[j + 1] = g * k; m.rgb[j + 2] = bl * k; }
+    m.pos[j] = m.base[j]; m.pos[j + 1] = m.base[j + 1]; m.pos[j + 2] = m.base[j + 2];
+    m.rot[j] = m.rot0[j]; m.rot[j + 1] = m.rot0[j + 1]; m.rot[j + 2] = m.rot0[j + 2];
+    m.scl[j] = m.scl[j + 1] = m.scl[j + 2] = 1;
+    for (let k = 0; k < X.length; k++) {
+      const e = X[k], s = S.series.get(e.key);
+      if (!s) continue;
+      const arr = e.prop === 0 ? m.pos : e.prop === 1 ? m.rot : m.scl;
+      // additive (the default) is an offset on the actor's own value (scale: on 1); otherwise the value itself
+      if (e.add) arr[j + e.ax] += s.at(e.c, f); else arr[j + e.ax] = s.at(e.c, f);
+    }
+  }
+  let a = 0, na = 0;
+  for (let k = 0; k < m.mpcS.length; k++) {
+    const e = m.mpcS[k], s = S.series.get(e.key);
+    if (s) { const v = (s.at(0, f) - e.lo) / e.span; a += v < 0 ? 0 : v > 1 ? 1 : v; na++; }
+  }
+  m.amb = na ? a / na : 0;
+  let tr = 1, tg = 1, tb = 1;
+  for (let k = 0; k < m.mpcC.length; k++) {
+    const s = S.series.get(m.mpcC[k].key);
+    if (s) { s.rgba(0, f, CB); tr = CB[0]; tg = CB[1]; tb = CB[2]; if (!na) m.amb = 0.5; break; }
+  }
+  const amb = (m.mpcS.length || m.mpcC.length) ? m.amb : 0, tm = Math.max(tr, tg, tb, 1e-6);
+  m.tint[0] = tr / tm * amb; m.tint[1] = tg / tm * amb; m.tint[2] = tb / tm * amb;
+}
+// UE rotator (pitch, yaw, roll in degrees) -> forward, right, up into F3, R3, U3 (rotBasis without allocating)
+function basisTo(p, y, r) {
+  p *= Math.PI / 180; y *= Math.PI / 180; r *= Math.PI / 180;
+  const SP = Math.sin(p), CP = Math.cos(p), SY = Math.sin(y), CY = Math.cos(y), SR = Math.sin(r), CR = Math.cos(r);
+  F3[0] = CP * CY; F3[1] = CP * SY; F3[2] = SP;
+  R3[0] = SR * SP * CY - CR * SY; R3[1] = SR * SP * SY + CR * CY; R3[2] = -SR * CP;
+  U3[0] = -(CR * SP * CY + SR * SY); U3[1] = CY * SR - CR * SP * SY; U3[2] = CR * CP;
+}
+function setupCamera(m, mode) {
+  const r = P3.r, aspect = P3.w / Math.max(1, P3.h);
+  if (mode === "camera" && m.cam) {
+    const c = m.cam, rot = c.rotation || [0, 0, 0];
+    basisTo(+rot[0] || 0, +rot[1] || 0, +rot[2] || 0);
+    EYE[0] = +c.location[0] || 0; EYE[1] = +c.location[1] || 0; EYE[2] = +c.location[2] || 0;
+    const hfov = clamp(+c.fov || 90, 5, 170) * Math.PI / 180;           // Unreal's field of view is horizontal
+    const far = m.radius * 8 + Math.hypot(EYE[0] - m.centre[0], EYE[1] - m.centre[1], EYE[2] - m.centre[2]);
+    r.camera(EYE, F3, R3, U3, 2 * Math.atan(Math.tan(hfov / 2) / aspect), aspect, Math.max(1, m.radius * 0.002), far);
+    return;
+  }
+  const o = P3.orbit;
+  basisTo(o.pitch, o.yaw, 0);
+  EYE[0] = o.t[0] - F3[0] * o.dist; EYE[1] = o.t[1] - F3[1] * o.dist; EYE[2] = o.t[2] - F3[2] * o.dist;
+  r.camera(EYE, F3, R3, U3, VFOV, aspect, Math.max(0.5, o.dist * 0.005), o.dist + m.radius * 8);
+}
+function draw3D(f, force) {
+  const r = P3.r;
+  if (!P3.w) sizeView3();
+  const m = model3(), mode = S.view3;
+  if (!force && !P3.dirty && f === P3.lastF) return false;
+  P3.lastF = f; P3.dirty = false;
+  r.nSprites = 0; r.nBoxes = 0; r.nDyn = 0;
+  const empty = !m.n || (mode !== "orbit" && !m.cam);
+  overlay3(m, mode, empty);
+  if (!empty) {
+    evalModel(m, f);
+    r.amb[0] = m.tint[0]; r.amb[1] = m.tint[1]; r.amb[2] = m.tint[2];
+    if (mode === "dome") fillDome(m); else { setupCamera(m, mode); fillPerspective(m); }
+    r.fade[0] = m.gridFade[0]; r.fade[1] = m.gridFade[1]; r.fade[2] = m.gridFade[2];
+  }
+  r.nGrid = m.nGrid;
+  // lines: orbit draws the grid and the camera glyph, camera mode the grid only, dome none
+  r.render(empty ? 0 : mode === "orbit" ? 2 : mode === "camera" ? 1 : 0);
+  drawMeters(f);
+  return true;
+}
+// a lamp's core: 3x its emitted colour, but never darker than a quarter of the colour itself, so a light at its
+// minimum still reads as a lamp of that colour (the halo and the floor pool carry the intensity)
+function coreGain(b) { return Math.max(3, 0.25 / (0.04 + 0.96 * b)); }
+function fillPerspective(m) {
+  const r = P3.r, u = m.unit, dpr = P3.dpr, drop = S.view3 === "orbit";
+  for (let i = 0, j = 0; i < m.n; i++, j += 3) {
+    const x = m.pos[j], y = m.pos[j + 1], z = m.pos[j + 2], b = m.b[i];
+    if (b < 0) { r.sprite(x, y, z, 2.2 * dpr, 0.03, 0.032, 0.035, GL.MARKER); continue; }
+    const cr = m.rgb[j], cg = m.rgb[j + 1], cb = m.rgb[j + 2], k = m.kind[i];
+    if (drop && z - m.floorZ > u) r.line(x, y, z, x, y, m.floorZ, 0.007);   // drop line to the floor: reads the height
+    if (k === KIND_MESH) {
+      basisTo(m.rot[j], m.rot[j + 1], m.rot[j + 2]);
+      const h = u * 0.7;
+      r.box(x, y, z, F3, R3, U3, h * m.scl[j], h * m.scl[j + 1], h * m.scl[j + 2], cr * 2, cg * 2, cb * 2, 1);
+      if (cr + cg + cb > 0) r.sprite(x, y, z, u * (1.6 + 2.4 * b), cr * 0.45, cg * 0.45, cb * 0.45, GL.HALO);
+      continue;
+    }
+    if (cr + cg + cb <= 0) { r.sprite(x, y, z, 3 * dpr, 0.06, 0.064, 0.07, GL.MARKER); continue; }
+    const s = 0.5 + 0.5 * Math.max(m.scl[j], m.scl[j + 1], m.scl[j + 2]);
+    const lamp = coreGain(b);
+    r.sprite(x, y, z, u * (1.3 + 3.4 * b) * s, cr * 0.5, cg * 0.5, cb * 0.5, GL.HALO);
+    r.sprite(x, y, z, u * 0.42 * s, cr * lamp, cg * lamp, cb * lamp, GL.CORE);
+    if (k === KIND_LIGHT) {
+      const ht = z - m.floorZ;
+      if (ht > u) {
+        const rad = clamp(ht * 0.9, u * 2, m.radius * 0.8), q = ht / m.radius, fall = 0.16 / (1 + q * q);
+        r.sprite(x, y, m.floorZ + 0.5, rad, cr * fall, cg * fall, cb * fall, GL.POOL);
+      }
+    }
+  }
+}
+// dome: every actor placed on the domemaster circle with domeProjectTo; sizes are the angle each glow subtends
+function fillDome(m) {
+  const r = P3.r, u = m.unit, dpr = P3.dpr, g = domeGeo3(m), cam = m.cam, ax = m.domeAx, half = g.half;
+  r.screen = true;
+  const cx = +cam.location[0] || 0, cy = +cam.location[1] || 0, cz = +cam.location[2] || 0, k = g.R * dpr / half;
+  for (let i = 0, j = 0; i < m.n; i++, j += 3) {
+    const x = m.pos[j], y = m.pos[j + 1], z = m.pos[j + 2], b = m.b[i];
+    if (!domeProjectTo(x, y, z, cam, ax, half, PXY)) continue;
+    const nx = (g.cx + PXY[0] * g.R) / P3.w * 2 - 1, ny = 1 - (g.cy + PXY[1] * g.R) / P3.h * 2;
+    const dist = Math.hypot(x - cx, y - cy, z - cz) || 1;
+    if (b < 0) { r.sprite(nx, ny, 0, 2 * dpr, 0.03, 0.032, 0.035, GL.MARKER); continue; }
+    const cr = m.rgb[j], cg = m.rgb[j + 1], cb = m.rgb[j + 2];
+    if (cr + cg + cb <= 0) { r.sprite(nx, ny, 0, 3 * dpr, 0.06, 0.064, 0.07, GL.MARKER); continue; }
+    // the angle a glow subtends, as pixels on the circle (with a floor, so every driven actor stays readable)
+    r.sprite(nx, ny, 0, Math.max(7 * dpr, Math.atan(u * (1.3 + 3.4 * b) / dist) * k * 1.5), cr * 0.5, cg * 0.5, cb * 0.5, GL.HALO);
+    const lamp = coreGain(b);
+    r.sprite(nx, ny, 0, Math.max(3.5 * dpr, Math.atan(u * 0.42 / dist) * k), cr * lamp, cg * lamp, cb * lamp, GL.CORE);
+  }
+}
+function domeGeo3(m) {
+  const g = P3.domeG;
+  if (g && g.w === P3.w && g.h === P3.h && g.m === m) return g;
+  return (P3.domeG = { w: P3.w, h: P3.h, m, cx: P3.w / 2, cy: P3.h / 2, R: Math.min(P3.w, P3.h) / 2 - 12, half: (m.domeAngle / 2) * Math.PI / 180 });
+}
+// the 2D layer over the GL view: dome reticle and the empty-state note; redrawn only when the view changes
+function overlay3(m, mode, empty) {
+  const key = `${mode}|${P3.w}|${P3.h}|${P3.dpr}|${empty}|${m.n}|${!!S.scene}`;
+  if (key === P3.ovKey) return;
+  P3.ovKey = key;
+  const dpr = P3.dpr;
+  ovCv.width = Math.round(P3.w * dpr); ovCv.height = Math.round(P3.h * dpr);
+  const ctx = ovCv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, P3.w, P3.h);
+  const note = $("#schem-empty");
+  note.hidden = !empty;
+  if (empty) {
+    note.querySelector("b").textContent = !S.scene ? "No scene.json" : !m.n ? "scene.json has no actor positions" : "scene.json has no camera";
+    note.querySelector("span").textContent = !S.scene || !m.n ? "Scan reads actors, positions and the camera from the editor (it needs the live link)." : "Orbit shows the actors. Scan again once the level has a camera.";
+    return;
+  }
+  if (mode !== "dome") return;
+  const g = domeGeo3(m), half = m.domeAngle / 2;
+  ctx.strokeStyle = C.line2; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, g.R, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = C.line;
+  for (const deg of [30, 60, 90, 120, 150]) if (deg < half) { ctx.beginPath(); ctx.arc(g.cx, g.cy, g.R * deg / half, 0, Math.PI * 2); ctx.stroke(); }
+  ctx.beginPath(); ctx.moveTo(g.cx - g.R, g.cy); ctx.lineTo(g.cx + g.R, g.cy); ctx.moveTo(g.cx, g.cy - g.R); ctx.lineTo(g.cx, g.cy + g.R); ctx.stroke();
+  if (m.domeAx.dome) {
+    ctx.font = F11; ctx.fillStyle = C.faint; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("front", g.cx, DOME_FORWARD_DOWN > 0 ? g.cy + g.R + 8 : g.cy - g.R - 8);
+    ctx.textAlign = "left";
+  }
+}
+function hud3() {
+  const m = P3.m, el = $("#schem-label");
+  if (!P3.r || !m) return;
+  const mode = S.view3, cam = m.cam;
+  let t = "";
+  if (mode === "orbit") t = m.n ? `${m.n} actors, ${m.nDriven} driven` : "";
+  else if (cam && mode === "camera") t = `${cam.actor || "camera"}  ${String(cam.projection || "").startsWith("dome") ? "forward" : "view"}  ${fmt(clamp(+cam.fov || 90, 5, 170), 0)}°`;
+  else if (cam) t = `${cam.actor || "camera"}  ${fmt(m.domeAngle, 0)}°  pitch ${fmt(+(cam.rotation || [0])[0] || 0, 0)}` + (m.domeAx.dome ? "" : "  (not a domemaster: fisheye along its forward axis)");
+  el.textContent = t;
+  $("#schem-fit").hidden = mode !== "orbit" || !m.n;
+  glCv.classList.toggle("orbit", mode === "orbit");
+  document.querySelectorAll("#schem .tabs button").forEach((b) => { if (b.dataset.view === "camera" || b.dataset.view === "dome") b.disabled = !cam; });
+}
+// One row per output under the view: channel bars (or true colours) at the playhead, and the value.
+function drawMeters(f) {
+  const outs = (S.bake && S.bake.outputs) || [];
+  const rows = Math.min(outs.length, 12), rowH = 18, H = rows ? rows * rowH + 8 : 0;
+  const key = `${P3.mw}|${H}|${P3.dpr}|${S.bakeId}`;
+  if (key === P3.meterKey && f === P3.meterF) return;
+  P3.meterF = f;
+  if (key !== P3.meterKey) {
+    P3.meterKey = key;
+    meterCv.style.height = H + "px";
+    meterCv.hidden = !H;
+    meterCv.width = Math.round(P3.mw * P3.dpr); meterCv.height = Math.round(H * P3.dpr);
+  }
+  if (!H) return;
+  const ctx = meterCv.getContext("2d"), w = P3.mw;
+  ctx.setTransform(P3.dpr, 0, 0, P3.dpr, 0, 0);
+  ctx.fillStyle = C.panel; ctx.fillRect(0, 0, w, H);
+  ctx.font = F11; ctx.textBaseline = "middle";
+  const x0 = 96, x1 = w - 64;
+  for (let i = 0; i < rows; i++) {
+    const o = outs[i], y = 4 + i * rowH, mid = y + rowH / 2, s = S.series.get("o:" + o.id), n = o.channels.length;
+    ctx.fillStyle = C.dim; ctx.textAlign = "left";
+    ctx.fillText(o.id.length > 14 ? o.id.slice(0, 13) + "…" : o.id, 12, mid);
+    const bw = x1 - x0, gap = n > 1 && bw / n > 4 ? 1 : 0, cw = (bw - gap * (n - 1)) / n, hh = rowH - 6;
+    if (isColor(o)) {
+      for (let c = 0; c < n; c++) {
+        if (s) { s.rgba(c, f, CB); ctx.fillStyle = rgbCss(toSRGB(CB[0], CB[1], CB[2], C8)); } else ctx.fillStyle = C.line;
+        ctx.fillRect(x0 + c * (cw + gap), y + 3, Math.max(1, cw), hh);
+      }
+      ctx.fillStyle = C.faint; ctx.textAlign = "right"; ctx.fillText("colour", w - 12, mid);
+      continue;
+    }
+    const lo = o.min ?? 0, hi = o.max ?? 1, span = (hi - lo) || 1;
+    let sum = 0;
+    for (let c = 0; c < n; c++) {
+      const v = s ? s.at(c, f) : lo, b = clamp((v - lo) / span, 0, 1), xa = x0 + c * (cw + gap);
+      sum += v;
+      ctx.fillStyle = C.line; ctx.fillRect(xa, y + 3, Math.max(1, cw), hh);
+      ctx.fillStyle = C.accent;
+      if (n > 1) { const bh = Math.max(b > 0 ? 1 : 0, Math.round(hh * b)); ctx.fillRect(xa, y + 3 + hh - bh, Math.max(1, cw), bh); }
+      else ctx.fillRect(xa, y + 3, Math.round(cw * b), hh);
+    }
+    ctx.fillStyle = C.text; ctx.textAlign = "right";
+    ctx.fillText(s ? fmtVal(sum / n) : "-", w - 12, mid);
+  }
+  ctx.textAlign = "left";
+}
+function sizeView3() {
+  const r = schemView.getBoundingClientRect();
+  P3.w = Math.max(1, Math.round(r.width)); P3.h = Math.max(1, Math.round(r.height));
+  P3.mw = Math.max(1, Math.round($("#schem").getBoundingClientRect().width));
+  P3.dpr = Math.min(window.devicePixelRatio || 1, 2);
+  P3.r.resize(P3.w, P3.h, P3.dpr);
+  P3.dirty = true; P3.domeG = null;
+}
+let schemRaf = 0;
+function requestSchem() {
+  P3.dirty = true;
+  if (schemRaf) return;
+  schemRaf = requestAnimationFrame(() => { schemRaf = 0; drawSchem(false); });
+}
+// orbit: drag turns, right-drag / middle-drag / Shift-drag pans, the wheel zooms, a double-click frames
+function attachOrbit() {
+  glCv.addEventListener("contextmenu", (e) => e.preventDefault());
+  glCv.addEventListener("mousedown", (e) => {
+    if (S.view3 !== "orbit" || !P3.m || !P3.m.n) return;
+    e.preventDefault();
+    const pan = e.button !== 0 || e.shiftKey, o = P3.orbit, x0 = e.clientX, y0 = e.clientY;
+    const yaw0 = o.yaw, pitch0 = o.pitch, t0 = o.t.slice();
+    basisTo(o.pitch, o.yaw, 0);
+    const R = [R3[0], R3[1], R3[2]], U = [U3[0], U3[1], U3[2]], k = 2 * o.dist * Math.tan(VFOV / 2) / Math.max(1, P3.h);
+    P3.drag = true; glCv.classList.add("dragging"); $("#schem-tip").hidden = true;
+    const move = (ev) => {
+      const dx = ev.clientX - x0, dy = ev.clientY - y0;
+      if (pan) for (let i = 0; i < 3; i++) o.t[i] = t0[i] - R[i] * dx * k + U[i] * dy * k;
+      else { o.yaw = yaw0 + dx * 0.4; o.pitch = clamp(pitch0 - dy * 0.4, -89, 89); }
+      o.user = true;
+      requestSchem();
+    };
+    const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); P3.drag = false; glCv.classList.remove("dragging"); };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  });
+  glCv.addEventListener("wheel", (e) => {
+    if (S.view3 !== "orbit" || !P3.m || !P3.m.n) return;
+    e.preventDefault();
+    const o = P3.orbit;
+    o.dist = clamp(o.dist * Math.exp(e.deltaY * 0.0012), P3.m.radius * 0.05, P3.m.radius * 60);
+    o.user = true;
+    requestSchem();
+  }, { passive: false });
+  const reframe = () => { if (P3.m && P3.m.n) { frameOrbit(P3.m); P3.orbit.user = false; requestSchem(); } };
+  glCv.addEventListener("dblclick", () => { if (S.view3 === "orbit") reframe(); });
+  $("#schem-fit").onclick = reframe;
+  glCv.addEventListener("mousemove", (e) => { if (!P3.drag) hover3(e); });
+  glCv.addEventListener("mouseleave", () => { $("#schem-tip").hidden = true; });
+}
+// hover: the actor nearest the pointer (within 14 px) and what drives it, at the playhead
+function hover3(e) {
+  const m = P3.m, tip = $("#schem-tip");
+  if (!m || !m.n || (S.view3 !== "orbit" && !m.cam)) { tip.hidden = true; return; }
+  const rc = glCv.getBoundingClientRect(), x = e.clientX - rc.left, y = e.clientY - rc.top;
+  const g = S.view3 === "dome" ? domeGeo3(m) : null;
+  let best = -1, bd = 14 * 14;
+  for (let i = 0, j = 0; i < m.n; i++, j += 3) {
+    let sx, sy;
+    if (g) {
+      if (!domeProjectTo(m.pos[j], m.pos[j + 1], m.pos[j + 2], m.cam, m.domeAx, g.half, PXY)) continue;
+      sx = g.cx + PXY[0] * g.R; sy = g.cy + PXY[1] * g.R;
+    } else {
+      if (!P3.r.project(m.pos[j], m.pos[j + 1], m.pos[j + 2], PXY)) continue;
+      sx = PXY[0]; sy = PXY[1];
+    }
+    const d = (sx - x) * (sx - x) + (sy - y) * (sy - y);
+    if (d < bd) { bd = d; best = i; }
+  }
+  if (best < 0) { tip.hidden = true; return; }
+  const f = frameOf(curT()), lines = [m.names[best]];
+  for (const { o, c } of m.outs[best]) {
+    const s = S.series.get("o:" + o.id);
+    if (!s) continue;
+    if (isColor(o)) { s.rgba(c, f, CB); lines.push(`${o.id}  ${fmt(CB[0], 2)} ${fmt(CB[1], 2)} ${fmt(CB[2], 2)}`); }
+    else lines.push(`${o.id}  ${fmtVal(s.at(c, f))}`);
+  }
+  if (lines.length === 1) lines.push("not driven");
+  tip.textContent = lines.join("\n");
+  tip.hidden = false;
+  tip.style.left = `${Math.max(4, Math.min(x + 12, P3.w - tip.offsetWidth - 4))}px`;
+  tip.style.top = `${Math.max(4, Math.min(y + 12, P3.h - tip.offsetHeight - 4))}px`;
+}
+// WebGL2 on, unless the browser lacks it or the page was opened with ?gl=0 (to check the 2D fallback)
+function init3D() {
+  const off = new URLSearchParams(location.search).get("gl") === "0";
+  P3.r = GL && !off ? GL.create(glCv) : null;
+  const on = !!P3.r;
+  glCv.hidden = ovCv.hidden = !on;
+  $("#schem-hud").hidden = !on;
+  schem.hidden = on;
+  schemView.classList.toggle("gl", on);
+  if (!on) {
+    // the 2D views: ring (outputs as rings and bars), plan, dome
+    const spec = [["ring", "Ring", "Outputs as rings and bars (V cycles)"], ["plan", "Plan", "Top-down plan of the scanned actors"], ["dome", "Dome", "Domemaster seen from the scene camera"]];
+    document.querySelectorAll("#schem .tabs button").forEach((b, i) => { b.dataset.view = spec[i][0]; b.textContent = spec[i][1]; b.title = spec[i][2]; });
+    return;
+  }
+  P3.r.onrestore = () => { P3.m = null; requestSchem(); };
+  attachOrbit();
+  new ResizeObserver(() => { sizeView3(); P3.ovKey = ""; P3.meterKey = ""; drawSchem(); }).observe(schemView);
+}
+const VIEWS_GL = ["orbit", "camera", "dome"], VIEWS_2D = ["ring", "plan", "dome"];
 
 // ------------------------------------------------------------------------------------------- params + graph editing
 const SKIP_KEYS = new Set(["id", "op", "in", "track", "signal", "target", "layer", "fn", "shape", "order", "preset", "direction", "value_type"]);
@@ -2095,7 +2585,7 @@ function updateReadouts() {
 function onTimeChanged() {
   updateReadouts();
   placePlayhead();
-  drawSchem();
+  drawSchem(false);
 }
 function followTo(t) {
   if (!$("#follow").checked) return;
@@ -2503,7 +2993,7 @@ document.addEventListener("keydown", (e) => {
   else if (key === "p") makePattern();
   else if (key === "u") unlinkPatterns();
   else if (key === "f") { $("#follow").checked = !$("#follow").checked; msg(`follow ${$("#follow").checked ? "on" : "off"}`); }
-  else if (key === "v") setView3({ ring: "plan", plan: "dome", dome: "ring" }[S.view3]);
+  else if (key === "v") cycleView3();
   else if (e.key === "=" || e.key === "+") zoomTo(S.view.pps * 1.5, clamp(xOf(curT()), 0, S.width));
   else if (e.key === "-") zoomTo(S.view.pps / 1.5, clamp(xOf(curT()), 0, S.width));
   else if (e.key === "\\") zoomFit();
@@ -2578,7 +3068,8 @@ async function boot() {
   for (const k of ["ruler", "sections", "wave"]) canvases.add(document.querySelector(`canvas[data-kind="${k}"]`));
   attachSeek(document.querySelector('canvas[data-kind="ruler"]'), true);
   attachSeek(document.querySelector('canvas[data-kind="wave"]'), true);
-  setView3(lsGet("view3", "ring"));
+  init3D();
+  setView3(lsGet("view3", "orbit"));
   $("#click").classList.toggle("on", Metro.on);
   $("#rec-replace").classList.toggle("on", !!lsGet("replace", false));
   $("#rec-lat").value = lsGet("latency", 30);
