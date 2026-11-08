@@ -288,7 +288,8 @@ def analyze(rig_path: str) -> str:
 def describe_audio(rig_path: str, start_s: float = 0.0, end_s: float | None = None, window_s: float | None = None) -> str:
     """Describe the song so you can reason about its structure without hearing it: per time window (default one bar),
     the level of each band (0..1, dB-scaled over the whole song) and its hit count, plus candidate section boundaries
-    where the energy changes sharply. Boundaries are energy changes, not labelled sections."""
+    where the energy changes sharply, and the labelled song structure (intro / build / breakdown / drop / outro ...) on
+    bar lines."""
     import scipy.signal as sg
     p, data, rig = _load(rig_path)
     a = _analysis(rig)
@@ -335,9 +336,12 @@ def describe_audio(rig_path: str, start_s: float = 0.0, end_s: float | None = No
                             "rose": [names[k] for k in np.flatnonzero(d >= 0.2)],
                             "fell": [names[k] for k in np.flatnonzero(d <= -0.2)]})
     beats = [b["time"] for b in m.get("beats") or [] if t0 <= b["time"] < t1]
+    from .analysis import song_structure
+    secs = [{k: s[k] for k in ("name", "time", "bars", "kick", "bass_db", "energy_db")} for s in song_structure(a)]
     return _j({"range_s": [_r(t0, 2), _r(t1, 2)], "window_s": _r(w, 3), "bpm": bpm, "beats_in_range": len(beats),
-               "bands": names, "rows": rows, "candidate_boundaries": changes,
-               "legend": "level per band 0..1 (dB over the whole song), hits = clear onsets in that band per window"})
+               "bands": names, "rows": rows, "candidate_boundaries": changes, "sections": secs, "stems": a.stems_label(),
+               "legend": "level per band 0..1 (dB over the whole song), hits = clear onsets in that band per window; "
+                         "sections = labelled song structure on bar lines (notes sections init writes them)"})
 
 
 # ------------------------------------------------------------------------------------------------ rig tools

@@ -149,7 +149,7 @@ def cmd_notes_snap(a):
 
 
 def cmd_sections(a):
-    from .analysis import name_sections, section_boundaries
+    from .analysis import name_sections, section_boundaries, song_structure
     rig = load_rig(a.rig)
     path = rig.notes_path
     notes = load_notes(path)
@@ -164,16 +164,28 @@ def cmd_sections(a):
     if an is None:
         print("rig has no audio", file=sys.stderr)
         return 2
-    secs, _ = section_boundaries(an, a.window_s, a.min_bars)
-    named = name_sections(secs)
+    if a.method == "energy":
+        secs, _ = section_boundaries(an, a.window_s, a.min_bars or 2)
+        named = name_sections(secs)
+    else:
+        secs = song_structure(an, a.min_bars)
+        an.save()                                             # band powers it computed join the cache
+        named = [{"name": s["name"], "time": s["time"]} for s in secs]
     notes["sections"] = named
     if not notes["bpm_map"]:
         notes["bpm_map"], notes["grid_offset"] = an.bpm_map, an.grid_offset
     save_notes(path, notes)
-    for s, n in zip(secs, named):
-        ch = (" rose " + ",".join(s["rose"]) if s["rose"] else "") + (" fell " + ",".join(s["fell"]) if s["fell"] else "")
-        print(f"{n['time']:9.3f}s  {n['name']:<12} level {s['level']}{ch}")
-    print(f"{len(named)} sections -> {path} (names are a guess from energy; edit them freely)")
+    if a.method == "energy":
+        for s, n in zip(secs, named):
+            ch = (" rose " + ",".join(s["rose"]) if s["rose"] else "") + (" fell " + ",".join(s["fell"]) if s["fell"] else "")
+            print(f"{n['time']:9.3f}s  {n['name']:<12} level {s['level']}{ch}")
+        print(f"{len(named)} sections -> {path} (names are a guess from energy; edit them freely)")
+        return 0
+    for s in secs:
+        z = "" if s["novelty"] is None else f"  novelty z {s['novelty']}"
+        print(f"{s['time']:9.3f}s  bar {s['bar']:<4} {s['name']:<12} {s['bars']:>3} bars  kick {s['kick']}/bar  "
+              f"bass {s['bass_db']} dB  level {s['energy_db']} dB{z}")
+    print(f"{len(named)} sections on bar lines -> {path} (from {an.stems_label()}; edit the names freely)")
     return 0
 
 
@@ -361,8 +373,12 @@ def main(argv=None):
     p = ns.add_parser("sections", help="sections init (from the analysis) | list")
     p.add_argument("sub", choices=["init", "list"])
     p.add_argument("rig")
-    p.add_argument("--window-s", type=float, default=None, help="analysis window (default: one bar)")
-    p.add_argument("--min-bars", type=int, default=2, help="shortest section, in windows")
+    p.add_argument("--method", choices=["structure", "energy"], default="structure",
+                   help="structure (default): labelled sections from novelty on stem and drum features; energy: the v0.2 "
+                        "band-level changes")
+    p.add_argument("--window-s", type=float, default=None, help="energy: analysis window (default: one bar)")
+    p.add_argument("--min-bars", type=int, default=None,
+                   help="shortest section in bars (structure: 8 in a song of 64 bars or more, 4 from 24, else 2; energy: 2)")
     p.add_argument("--replace", action="store_true")
     p.set_defaults(fn=cmd_sections)
     p = ns.add_parser("pattern", help="pattern make | place | list (linked loops)")

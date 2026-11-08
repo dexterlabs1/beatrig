@@ -1085,6 +1085,208 @@ def name_sections(secs):
     return out
 
 
+# ---------- song structure (labelled sections on bar lines)
+STRUCT_WIDTHS = (2, 4, 8)          # bars each side of a candidate boundary in the contrast novelty
+STRUCT_FLOOR_DB = 24.0             # levels more than this under the song's loud bars count as "absent", all alike
+STRUCT_Z = 1.5                     # novelty peak (robust z) that makes a boundary
+PHRASE_BONUS = 0.25                # novelty bonus on 8-bar phrase lines (half on 4-bar lines)
+BASS_ON_DB = -15.0                 # a bar "has bass" when the bass stem is within this of its loud bars
+BASS_FLOOR_ON_DB = -6.0            # ... or, from the mix alone, when the 50-250 Hz floor between hits is
+RISE_DB = 6.0                      # a full section whose rising part (other stem / mid bands) climbs this much is a build
+
+
+def bar_lines(a):
+    """bar line times over the whole song: the analysis' downbeats (the model's bars, extended by whole bars before
+    the first and after the last), else bars of 4 beats from the grid offset. A bar line starting in the last quarter
+    bar of the file is dropped."""
+    m = a.meta
+    dur = float(m["duration"])
+    bpm = m["bpm_map"][0]["bpm"] if m.get("bpm_map") else 120.0
+    bars = m.get("bars") or {}
+    bar_len = int(bars.get("meter") or 4) * 60.0 / bpm
+    downs = np.asarray(bars.get("downbeats") or [], np.float64)
+    if len(downs):
+        pre = np.arange(downs[0] - bar_len, 0.25 * bar_len - 1e-9, -bar_len)[::-1]
+        post = np.arange(downs[-1] + bar_len, dur, bar_len)
+        edges = np.concatenate((pre, downs, post))
+    else:
+        edges = np.arange(float(m.get("grid_offset") or 0.0) % bar_len, dur, bar_len)
+    edges = edges[edges < dur - 0.25 * bar_len]
+    if not len(edges) or edges[0] > 0.25 * bar_len:
+        edges = np.concatenate(([0.0], edges))                # a pickup before the first bar line
+    else:
+        edges[0] = 0.0                                        # a sliver before the first bar joins the first bar
+    return edges, bar_len
+
+
+def _bar_db(env, edges, dur):
+    """per bar RMS level in dB relative to the song's loud bars (95th percentile), floored at -STRUCT_FLOOR_DB"""
+    out = []
+    for e0, e1 in zip(edges, list(edges[1:]) + [dur]):
+        seg = env[int(e0 * 1000):int(e1 * 1000)].astype(np.float64)
+        out.append(20 * np.log10(np.sqrt(np.mean(seg ** 2)) + 1e-9) if len(seg) else -200.0)
+    out = np.array(out)
+    return np.clip(out - np.percentile(out, 95), -STRUCT_FLOOR_DB, 6.0)
+
+
+def _bar_floor_db(env, edges, dur, pct=20):
+    """per bar, the pct-th percentile of the envelope in dB re the song's loud bars: a sustained bass keeps the low
+    band up between kicks, a kick alone lets it fall"""
+    out = []
+    for e0, e1 in zip(edges, list(edges[1:]) + [dur]):
+        seg = env[int(e0 * 1000):int(e1 * 1000)].astype(np.float64)
+        out.append(20 * np.log10(np.percentile(seg, pct) + 1e-9) if len(seg) else -200.0)
+    out = np.array(out)
+    return np.clip(out - np.percentile(out, 95), -STRUCT_FLOOR_DB, 6.0)
+
+
+def bar_features(a, edges):
+    """per bar: {"mix", stem names (dB re the loud bars), "kick"/"snare"/"hats" (hits per bar, from the drums stem
+    when there is one), "bands" ([7, bars] SECTION_BANDS levels 0..1), "rise" (dB of what builds up: the other stem,
+    else the mid bands)}"""
+    from .drums import part_hits
+    dur = float(a.meta["duration"])
+    a.ensure([("loud", None, None, None)])
+    f = {"mix": _bar_db(a.envelope("loud", None, None, 10, 150), edges, dur)}
+    stems = getattr(a, "stems", None) or {}
+    for s in ("drums", "bass", "other", "vocals"):
+        if s in stems:
+            stems[s].ensure([("loud", None, None, None)])
+            f[s] = _bar_db(stems[s].envelope("loud", None, None, 10, 150), edges, dur)
+    src = stems.get("drums", a)
+    bins = list(edges) + [dur]
+    for part in ("kick", "snare", "hats"):
+        f[part] = np.histogram((part_hits(src, part)[0] + 1) * HOP_MS / 1000.0, bins=bins)[0].astype(np.float64)
+    f["bands"] = band_levels(a, edges, dur)
+    if "bass" not in f:                                       # no stems: the floor of the 50-250 Hz band between hits
+        f["bass"] = _bar_floor_db(a.envelope("band", 50, 250, 10, 150), edges, dur)
+    if "other" in f:
+        f["rise"] = f["other"]
+    else:
+        mid = f["bands"][3:6].mean(axis=0)
+        f["rise"] = (mid - 1.0) * STRUCT_FLOOR_DB
+    return f
+
+
+def structure_novelty(F, widths=STRUCT_WIDTHS):
+    """contrast novelty: for the bar line before bar i, the distance between the mean feature vector of the w bars
+    before and the w bars after, averaged over the widths (a multi-scale checkerboard on the bar self-similarity)"""
+    n = len(F)
+    nov = np.zeros(n)
+    for i in range(1, n):
+        nov[i] = np.mean([np.linalg.norm(F[max(0, i - w):i].mean(axis=0) - F[i:min(n, i + w)].mean(axis=0)) for w in widths])
+    return nov
+
+
+def _phrase_offset(nov):
+    """the bar (mod 8) where 8-bar phrases start: the residue with the most novelty"""
+    return int(np.argmax([nov[o::8].sum() for o in range(8)])) if len(nov) else 0
+
+
+def song_structure(a, min_bars=None):
+    """Labelled song sections on bar lines: [{"name", "time", "bar", "label", "bars", "kick", "bass_db", "energy_db",
+    "novelty"}], the first at time 0.
+    - Features per bar: the mix level, each stem's level (all levels in dB under the song's loud bars, floored at
+      -24 dB so "absent" is one value), kick / snare / hats hits per bar (drum parts, from the drums stem when there
+      is one) and the 7 SECTION_BANDS levels.
+    - Boundaries: peaks of a multi-scale contrast novelty over those features (2, 4 and 8 bars each side), with a
+      25 % bonus on the song's 8-bar phrase lines, kept where the peak's robust z-score is at least 1.5, strongest
+      first and at least min_bars apart (default 8 bars in a song of 64 bars or more, 4 from 24 bars, else 2). Drums
+      (a kick on half the beats) or bass (the stem within 15 dB of its loud bars; from the mix, the 50-250 Hz floor
+      between hits within 6 dB) coming in or going out for 2 bars or more also makes a boundary, and so does a bar
+      with no kick between kick bars (a one-bar drop-out), on the bar after it. Boundaries are bar lines, so a
+      section never starts before its music changes.
+    - Labels from what plays: no kick = "breakdown" (shorter than 3 bars: "break"); kick without bass = "build" (after
+      a breakdown or a break) or "intro" (first); kick and bass = "intro" (first), "drop" (after a build, breakdown or
+      break, or straight after a drop and at least as loud), "build" (what rises climbs 6 dB or more and a breakdown
+      or drop follows), "dip" (2 dB or more under the song's other full sections) or "groove". The last section is
+      "outro" when it has no kick or is 3 dB or more under the full sections. Repeats are numbered (drop_2, ...).
+    Offline: the novelty compares bars before and after each line; the times are bar lines, never early."""
+    edges, bar_len = bar_lines(a)
+    nb = len(edges)
+    dur = float(a.meta["duration"])
+    if nb < 2:
+        return [{"name": "intro", "time": 0.0, "bar": 0, "label": "intro", "bars": nb, "kick": None, "bass_db": None,
+                 "energy_db": None, "novelty": None}]
+    if min_bars is None:                                      # phrases of 8 bars in a song; a short clip has short parts
+        min_bars = 8 if nb >= 64 else 4 if nb >= 24 else 2
+    f = bar_features(a, edges)
+    meter = int((a.meta.get("bars") or {}).get("meter") or 4)
+    stems = getattr(a, "stems", None) or {}
+    cols = [f["mix"] / 6.0] + [f[s] / 6.0 for s in ("drums", "bass", "other", "vocals") if s in stems]
+    if "bass" not in stems:
+        cols.append(f["bass"] / 6.0)                          # the mix's bass bands stand in
+    cols += [f["kick"] / (meter / 2), f["snare"] / (meter / 2), f["hats"] / meter]
+    cols += list(f["bands"] * 4.0)
+    F = np.stack(cols, axis=1)
+    raw = structure_novelty(F)
+    off = _phrase_offset(raw)
+    bonus = np.array([1 + PHRASE_BONUS if (i - off) % 8 == 0 else 1 + PHRASE_BONUS / 2 if (i - off) % 4 == 0 else 1.0 for i in range(nb)])
+    nov = raw * bonus
+    med = float(np.median(nov[1:]))
+    mad = float(np.median(np.abs(nov[1:] - med))) or 1e-9
+    z = (nov - med) / mad
+    padded = np.concatenate((np.zeros(2), nov, np.zeros(2)))
+    cands = [(float(z[i]), i) for i in range(1, nb) if nov[i] == padded[i:i + 5].max() and z[i] >= STRUCT_Z]
+    kick_on = f["kick"] >= meter / 2
+    bass_on = f["bass"] >= (BASS_ON_DB if "bass" in stems else BASS_FLOOR_ON_DB)
+    for i in range(1, nb - 1):                                # one-bar drop-outs start a section on the bar after
+        if not kick_on[i] and kick_on[i - 1] and kick_on[i + 1] and (i < 2 or kick_on[i - 2]):
+            cands.append((STRUCT_Z + 0.5, i + 1))
+    for i in range(2, nb - 1):                                # drums or bass come in or go out (and stay for 2 bars)
+        for on in (kick_on, bass_on):
+            if on[i] == on[i + 1] and on[i - 1] == on[i - 2] and on[i] != on[i - 1]:
+                cands.append((STRUCT_Z + 1.0, i))
+    keep = []
+    for score, i in sorted(cands, key=lambda c: (-c[0], c[1])):
+        if all(abs(i - k) >= min_bars for k in keep) and i >= min(min_bars, 4) and nb - i >= 1:
+            keep.append(i)
+    starts = [0] + sorted(keep)
+    secs = []
+    for j, s0 in enumerate(starts):
+        s1 = starts[j + 1] if j + 1 < len(starts) else nb
+        sl = slice(s0, s1)
+        q = max(1, (s1 - s0) // 4)
+        secs.append({"bar": s0, "bars": s1 - s0, "time": round(float(edges[s0]), 3) if s0 else 0.0,
+                     "kick": round(float(np.median(f["kick"][sl])), 2), "kick_on": bool(np.median(kick_on[sl].astype(float)) >= 0.5),
+                     "bass_db": round(float(np.median(f["bass"][sl])), 1), "bass_on": bool(np.median(bass_on[sl].astype(float)) >= 0.5),
+                     "energy_db": round(float(np.mean(f["mix"][sl])), 1),
+                     "rise_db": float(np.mean(f["rise"][s1 - q:s1]) - np.mean(f["rise"][s0:s0 + q])),
+                     "novelty": round(float(z[s0]), 1) if s0 else None})
+    full = [s for s in secs if s["kick_on"] and s["bass_on"]]
+    full_db = float(np.median([s["energy_db"] for s in full])) if full else 0.0
+    labels = []
+    for j, s in enumerate(secs):
+        prev = labels[-1] if labels else None
+        nxt_kick = secs[j + 1]["kick_on"] if j + 1 < len(secs) else None
+        if not s["kick_on"]:
+            lab = "intro" if j == 0 else "breakdown" if s["bars"] >= 3 else "break"
+        elif not s["bass_on"]:
+            lab = "intro" if j == 0 else "build"
+        elif j == 0:
+            lab = "intro"
+        elif prev in ("build", "breakdown", "break"):
+            lab = "drop"
+        elif prev == "drop" and s["energy_db"] >= secs[j - 1]["energy_db"] - 1.0:
+            lab = "drop"
+        elif s["rise_db"] >= RISE_DB and j + 1 < len(secs) and (nxt_kick is False or not secs[j + 1]["bass_on"]):
+            lab = "build"
+        elif s["energy_db"] <= full_db - 2.0:
+            lab = "dip"
+        else:
+            lab = "groove"
+        if j == len(secs) - 1 and j > 0 and (not s["kick_on"] or s["energy_db"] <= full_db - 3.0):
+            lab = "outro"
+        labels.append(lab)
+    used, out = {}, []
+    for s, lab in zip(secs, labels):
+        used[lab] = used.get(lab, 0) + 1
+        out.append({"name": lab if used[lab] == 1 else f"{lab}_{used[lab]}", "time": s["time"], "bar": s["bar"], "label": lab,
+                    "bars": s["bars"], "kick": s["kick"], "bass_db": s["bass_db"], "energy_db": s["energy_db"],
+                    "novelty": s["novelty"]})
+    return out
+
+
 def open_analysis(audio: str, cache_dir: str, settings: Optional[dict] = None, default_weights=None, use_cache: bool = True) -> "Analysis":
     """load the cache if the audio's size/mtime and the settings match, else run the base analysis"""
     a = Analysis(audio, cache_dir, settings, default_weights)
