@@ -105,8 +105,15 @@ def cmd_notes_init(a):
                 return 2
             node = dict(node, min_confidence=a.min_conf)
         times, vels = beat_times(node, ctx)
+    elif src == "drum":
+        from .drums import PARTS, drum_times
+        if nid not in PARTS:
+            print(f"--from drum:<part> needs one of {list(PARTS)}, got {nid!r}", file=sys.stderr)
+            return 2
+        times, vels, read = drum_times({"id": "_drum", "op": "drum", "part": nid}, ctx)
+        print(f"{nid}: read from the {'drums stem' if read == 'stem' else 'mix (' + an.stems_label() + ')'}")
     else:
-        print("--from must be onsets:<node>, beats[:<node>] or downbeats", file=sys.stderr)
+        print("--from must be onsets:<node>, beats[:<node>], downbeats or drum:<kick|snare|hats>", file=sys.stderr)
         return 2
     if not notes["bpm_map"] and an is not None:
         notes["bpm_map"] = an.bpm_map
@@ -336,7 +343,7 @@ def main(argv=None):
     p = ns.add_parser("init", help="fill a track from detected onsets or beats")
     p.add_argument("rig")
     p.add_argument("--track")
-    p.add_argument("--from", dest="source", help="onsets:<node> | beats[:<node>] | downbeats (bar lines)")
+    p.add_argument("--from", dest="source", help="onsets:<node> | beats[:<node>] | downbeats (bar lines) | drum:kick|snare|hats")
     p.add_argument("--min-conf", type=float, default=None,
                    help="beats: keep only beats whose analysis confidence is at least this (0..1)")
     p.set_defaults(fn=cmd_notes_init)

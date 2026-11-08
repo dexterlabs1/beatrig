@@ -827,9 +827,10 @@ class Analysis:
         self.dirty = False
 
     # -- the causal pass
-    def _scan(self, specs, base):
+    def _scan(self, specs, base, ref=True):
         """one pass over the file. specs: {key: (sos | None, weights)} -> 1 ms weighted power (sum over channels of
-        w_c * power of the filtered channel, so phase differences between channels cannot cancel). base: onset octave powers, 5 ms peaks, reference mono."""
+        w_c * power of the filtered channel, so phase differences between channels cannot cancel). base: onset octave powers, 5 ms peaks, reference mono
+        (ref False: no reference onsets, for a stem whose beats are never read)."""
         sr, C = self.sr, self.channels
         st = {k: dict(sos=sos, w=w, zi=None if sos is None else np.zeros((sos.shape[0], 2, C)), out=[]) for k, (sos, w) in specs.items()}
         if base:
@@ -840,7 +841,7 @@ class Analysis:
             q = max(1, int(round(sr / 12000)))
             lp = sg.butter(6, 0.8 * sr / q / 2, fs=sr, output="sos")
             lpzi, pos = np.zeros((lp.shape[0], 2)), 0
-            self._ref = RefFlux(sr / q)
+            self._ref = RefFlux(sr / q) if ref else None
             mw = None                                         # onset mono: equal downmix unless channel_weights says otherwise
             if self.default_weights is not None:
                 mw = weights_for(self.default_weights, C)
@@ -861,8 +862,9 @@ class Analysis:
                 if nb:
                     e = (np.arange(nb + 1) * sr * HOP_MS) // 1000
                     peaks.append(np.maximum.reduceat(np.abs(mono[:e[-1]]), e[:-1]))
-                yl, lpzi = sg.sosfilt(lp, mono, zi=lpzi)
-                self._ref.feed(yl[(-pos) % q::q].astype(np.float32))
+                if ref:
+                    yl, lpzi = sg.sosfilt(lp, mono, zi=lpzi)
+                    self._ref.feed(yl[(-pos) % q::q].astype(np.float32))
                 pos += len(mono)
         for k, s in st.items():
             self.arrays["pow:" + k] = _f32(np.concatenate(s["out"]) if s["out"] else np.zeros(0))
@@ -876,6 +878,13 @@ class Analysis:
         self.dirty = True
 
     def build_base(self):
+        if self.settings.get("beats") == "none":             # a stem: its bands and onsets are read, never its beats
+            self._scan({}, base=True, ref=False)
+            self.meta = dict(sr=self.sr, channels=self.channels, n_samples=self.n_samples, duration=round(self.duration, 6),
+                             beats=[], passages=[], rejected_passages=[], bpm_map=[], grid_offset=0.0, fallback=True,
+                             pulse={"confidence": 0.0, "covered": 0.0, "label": "not analysed (a stem)"}, tempo_candidates=[],
+                             beat_tracker={"name": "none"})
+            return
         self._scan({}, base=True)
         f = self.arrays["onset"].astype(np.float64)
         ref = self._ref.finish()
@@ -993,7 +1002,8 @@ class Analysis:
         """one line: whether stem features (drum parts, structure) read separated stems or the mix, and why"""
         s = self.stems_info or {}
         if s.get("used"):
-            return f"separated stems ({', '.join(sorted(self.stems))}) from {s.get('dir_name', 'the stem cache')}"
+            how = ", ".join(str(x) for x in (s.get("model"), s.get("device"), f"{s['seconds']} s" if "seconds" in s else None) if x)
+            return f"separated stems ({', '.join(sorted(self.stems))}) from {s.get('dir_name', 'the stem cache')}" + (f" ({how})" if how else "")
         return f"the mix ({s.get('why', 'stems not requested')})"
 
 

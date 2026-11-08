@@ -20,7 +20,14 @@ STEMS = ["drums", "bass", "vocals", "other"]
 MODEL = "htdemucs"
 
 
+_HASHES = {}                # (path, size, mtime) -> sha256, so every analyze of a long show does not re-read it
+
+
 def content_hash(path, chunk=1 << 22):
+    st = os.stat(path)
+    key = (os.path.abspath(path), st.st_size, st.st_mtime_ns)
+    if key in _HASHES:
+        return _HASHES[key]
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         while True:
@@ -28,7 +35,8 @@ def content_hash(path, chunk=1 << 22):
             if not b:
                 break
             h.update(b)
-    return h.hexdigest()
+    _HASHES[key] = h.hexdigest()
+    return _HASHES[key]
 
 
 def stem_dir(audio, digest=None, model=MODEL):
@@ -45,13 +53,40 @@ def cached(audio, model=MODEL):
 
 
 def available():
-    """(ok, reason): can this install separate stems?"""
-    try:
-        import torch  # noqa: F401
-        import demucs.pretrained  # noqa: F401
-    except ImportError as e:
-        return False, f"{e.name or e} is not installed: pip install beatrig[stems]"
+    """(ok, reason): can this install separate stems? Looks the packages up without importing them (importing torch
+    takes seconds, and a core install must never import it)."""
+    import importlib.util
+    for mod in ("torch", "demucs"):
+        try:
+            if importlib.util.find_spec(mod) is None:
+                return False, f"{mod} is not installed: pip install beatrig[stems]"
+        except (ImportError, ValueError):
+            return False, f"{mod} is not importable: pip install beatrig[stems]"
     return True, ""
+
+
+def cuda_available():
+    """True when torch sees a CUDA GPU (imports torch: call it only when a separation is about to run)"""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except ImportError:
+        return False
+
+
+def stem_cache_dir(stem_path):
+    """where a stem's own analysis cache lives: a folder per stem next to the stem wavs"""
+    base, _ = os.path.splitext(stem_path)
+    return base + ".analysis"
+
+
+def info(paths):
+    """the separation's stems.json ({model, device, seconds, ...}) for a {stem: path} dict, or {}"""
+    try:
+        with open(os.path.join(os.path.dirname(next(iter(paths.values()))), "stems.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError, StopIteration):
+        return {}
 
 
 def _stereo(x):

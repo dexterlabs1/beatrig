@@ -688,4 +688,4 @@ def input_ids(node):
 
 
 # the colour, per-hit flow, spatial and safety families register their ops on import
-from . import color, flow, spatial, safety  # noqa: E402,F401
+from . import color, flow, spatial, safety, drums  # noqa: E402,F401

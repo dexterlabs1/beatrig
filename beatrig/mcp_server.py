@@ -512,9 +512,10 @@ def get_notes(rig_path: str, track: str | None = None, start_s: float = 0.0, end
 @tool
 def notes_init(rig_path: str, track: str, source: str, threshold: float | None = None, replace: bool = False) -> str:
     """Fill a notes track from the audio. source: "band:LO-HI" (onsets in that Hz range, e.g. "band:40-120"),
-    "onsets:<node id>", "beats" (the verified beat grid), "beats:<node id>" or "downbeats" (the bar lines, when the
-    analysis knows them; else every 4th beat of the tempo map). Refuses to overwrite an existing track unless
-    replace=true. Seeds the notes tempo map from the analysis if it has none."""
+    "onsets:<node id>", "beats" (the verified beat grid), "beats:<node id>", "downbeats" (the bar lines, when the
+    analysis knows them; else every 4th beat of the tempo map) or "kick" / "snare" / "hats" (drum parts, from the
+    separated drums stem when there is one, else the mix; the result says which). Refuses to overwrite an existing
+    track unless replace=true. Seeds the notes tempo map from the analysis if it has none."""
     from .bake import make_ctx
     from .ops import beat_times, detect_onsets
     p, data, rig = _load(rig_path)
@@ -542,12 +543,22 @@ def notes_init(rig_path: str, track: str, source: str, threshold: float | None =
             raise ToolFailure(f"beats:<id> needs a beats node id, got {arg!r}")
     elif kind == "downbeats":
         node = {"id": "_downbeats", "op": "beats", "every": int((a.meta.get("bars") or {}).get("meter") or 4), "anchor": "bar"}
+    elif kind in ("kick", "snare", "hats", "drum"):
+        node = {"id": f"_{track}", "op": "drum", "part": arg if kind == "drum" else kind}
+        if node["part"] not in ("kick", "snare", "hats"):
+            raise ToolFailure('drum source is "kick", "snare" or "hats"')
     else:
-        raise ToolFailure('source must be "band:LO-HI", "onsets:<node>", "beats", "beats:<node>" or "downbeats"')
+        raise ToolFailure('source must be "band:LO-HI", "onsets:<node>", "beats", "beats:<node>", "downbeats", "kick", "snare" or "hats"')
     if threshold is not None and node.get("op") == "onsets":
         node = dict(node, threshold=float(threshold))
+    read = None
     if node["op"] == "onsets":
         times, vels = detect_onsets(node, ctx, rig.nodes)
+    elif node["op"] == "drum":
+        from .drums import drum_times
+        if threshold is not None:
+            node["threshold"] = float(threshold)
+        times, vels, read = drum_times(node, ctx)
     else:
         times, vels = beat_times(node, ctx)
     if not notes["bpm_map"]:
@@ -556,6 +567,8 @@ def notes_init(rig_path: str, track: str, source: str, threshold: float | None =
     notes["tracks"][track] = [{"time": float(t), "vel": round(float(v), 3)} for t, v in zip(times, vels)]
     _save_notes(rig, notes)
     diff = {"track": track, "source": source, "hits": [before, len(times)]}
+    if read is not None:
+        diff["read_from"] = "drums stem" if read == "stem" else f"mix: {a.stems_label()}"
     preview = _notify("notes_init", f"{track}: {len(times)} hits from {source}")
     return _j({"ok": True, "diff": diff, "summary": _track_summary(notes["tracks"][track]), "preview": preview,
                "next": f"add a node {{\"op\": \"notes\", \"track\": \"{track}\"}} to use it"})

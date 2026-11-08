@@ -19,7 +19,8 @@ ENUMS = {("lfo", "shape"): LFO_SHAPES, ("envelope", "shape"): SHAPES, ("math", "
          ("shuffle_hits", "mode"): ["bag", "random"], ("spatial_delay", "shape"): ["point", "axis", "plane"],
          ("spatial_delay", "direction"): ["out", "in"], ("dome_wave", "mode"): ["zenith_rings", "azimuth_sweep"],
          ("flash_limit", "mode"): ["first", "drop", "delay", "strongest"], ("beats", "velocity"): ["strength", "confidence"],
-         ("beats", "anchor"): ["first", "bar"]}
+         ("beats", "anchor"): ["first", "bar"], ("drum", "part"): ["kick", "snare", "hats"],
+         ("drum", "source"): ["auto", "stem", "mix"]}
 BLENDS = ("replace", "multiply", "add")
 TRIGGER_IN = ("envelope", "cycle", "push", "shuffle_hits", "every_n", "probability", "quantize")
 SPATIAL = ("spatial_delay", "dome_wave")
