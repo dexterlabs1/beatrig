@@ -1590,13 +1590,17 @@ function gridStep(v) { for (const s of [10, 20, 50, 100, 200, 500, 1000, 2000, 5
 
 function buildModel() {
   const sc = S.scene, actors = (sc && sc.actors) || {}, cam = sc && sc.camera && Array.isArray(sc.camera.location) ? sc.camera : null;
-  const names = [], kinds = [], base = [], rot0 = [], idx = new Map();
+  const names = [], kinds = [], base = [], rot0 = [], cones = [], idx = new Map();
   for (const a of Object.keys(actors)) {
     const A = actors[a];
     if (!Array.isArray(A.location) || (cam && a === cam.actor)) continue;
     const ks = new Set((A.components || []).map((c) => c.kind));
     idx.set(a, names.length); names.push(a);
     kinds.push(ks.has("light") ? KIND_LIGHT : ks.has("niagara") ? KIND_FX : ks.has("mesh") ? KIND_MESH : KIND_OTHER);
+    // a spot light: a beam along the actor's forward axis. The scan has no cone angle yet; read one if a scene file
+    // carries it (outer_cone_angle / cone_angle, the half-angle in degrees), else Unreal's default outer cone, 44
+    const spot = (A.components || []).find((c) => c.kind === "light" && /spot/i.test(String(c.class || "")));
+    cones.push(spot ? clamp(+(spot.outer_cone_angle ?? spot.cone_angle ?? 44) || 44, 1, 80) : 0);
     base.push(+A.location[0] || 0, +A.location[1] || 0, +A.location[2] || 0);
     const r = A.rotation || [0, 0, 0];
     rot0.push(+r[0] || 0, +r[1] || 0, +r[2] || 0);
@@ -1604,6 +1608,7 @@ function buildModel() {
   const n = names.length;
   const m = {
     scene: sc, bake: S.bake, cam, names, idx, n, kind: Uint8Array.from(kinds), base: Float32Array.from(base), rot0: Float32Array.from(rot0),
+    coneTan: Float32Array.from(cones.map((d) => (d ? Math.tan(d * Math.PI / 180) : 0))),
     bri: names.map(() => []), col: names.map(() => []), xf: names.map(() => []), outs: names.map(() => []),
     mpcS: [], mpcC: [], driven: new Uint8Array(n),
     b: new Float32Array(n), rgb: new Float32Array(n * 3), pos: new Float32Array(n * 3), rot: new Float32Array(n * 3), scl: new Float32Array(n * 3),
@@ -1642,7 +1647,7 @@ function buildModel() {
   m.nDriven = 0;
   for (let i = 0; i < n; i++) m.nDriven += m.driven[i];
   if (cam) { m.domeAx = domeAxes(cam); m.domeAngle = clamp(+cam.dome_angle || 180, 10, 360); }
-  P3.r.reserve(n * 3 + 8, n + 4, n + 4);
+  P3.r.reserve(n * 3 + 8, n + 4, n + 4, n + 4);
   P3.r.setLines(sceneLines(m));
   return m;
 }
@@ -1772,13 +1777,19 @@ function draw3D(f, force) {
   const m = model3(), mode = S.view3;
   if (!force && !P3.dirty && f === P3.lastF) return false;
   P3.lastF = f; P3.dirty = false;
-  r.nSprites = 0; r.nBoxes = 0; r.nDyn = 0;
+  r.nSprites = 0; r.nBoxes = 0; r.nDyn = 0; r.nCones = 0;
   const empty = !m.n || (mode !== "orbit" && !m.cam);
   overlay3(m, mode, empty);
   if (!empty) {
     evalModel(m, f);
     r.amb[0] = m.tint[0]; r.amb[1] = m.tint[1]; r.amb[2] = m.tint[2];
-    if (mode === "dome") fillDome(m); else { setupCamera(m, mode); fillPerspective(m); }
+    if (mode === "dome") fillDome(m);
+    else {
+      setupCamera(m, mode); fillPerspective(m);
+      // fog: a depth cue that keeps its strength at any zoom (scaled by the viewing distance plus the scene's size)
+      const vd = mode === "orbit" ? P3.orbit.dist : Math.hypot(EYE[0] - m.centre[0], EYE[1] - m.centre[1], EYE[2] - m.centre[2]);
+      r.fog = 0.55 / (vd + 1.5 * m.radius);
+    }
     r.fade[0] = m.gridFade[0]; r.fade[1] = m.gridFade[1]; r.fade[2] = m.gridFade[2];
   }
   r.nGrid = m.nGrid;
@@ -1801,14 +1812,26 @@ function fillPerspective(m) {
       basisTo(m.rot[j], m.rot[j + 1], m.rot[j + 2]);
       const h = u * 0.7;
       r.box(x, y, z, F3, R3, U3, h * m.scl[j], h * m.scl[j + 1], h * m.scl[j + 2], cr * 2, cg * 2, cb * 2, 1);
-      if (cr + cg + cb > 0) r.sprite(x, y, z, u * (1.6 + 2.4 * b), cr * 0.45, cg * 0.45, cb * 0.45, GL.HALO);
+      if (cr + cg + cb > 0) r.sprite(x, y, z, u * (1.6 + 2.4 * b), cr * 0.3, cg * 0.3, cb * 0.3, GL.HALO);
       continue;
     }
     if (cr + cg + cb <= 0) { r.sprite(x, y, z, 3 * dpr, 0.06, 0.064, 0.07, GL.MARKER); continue; }
     const s = 0.5 + 0.5 * Math.max(m.scl[j], m.scl[j + 1], m.scl[j + 2]);
     const lamp = coreGain(b);
-    r.sprite(x, y, z, u * (1.3 + 3.4 * b) * s, cr * 0.5, cg * 0.5, cb * 0.5, GL.HALO);
+    r.sprite(x, y, z, u * (1.3 + 3.4 * b) * s, cr * 0.3, cg * 0.3, cb * 0.3, GL.HALO);   // the bloom adds the rest
     r.sprite(x, y, z, u * 0.42 * s, cr * lamp, cg * lamp, cb * lamp, GL.CORE);
+    const tn = m.coneTan[i];
+    if (tn > 0) {
+      // spot: a beam down its forward axis, to the floor when it points at it; its pool lands where the beam does
+      basisTo(m.rot[j], m.rot[j + 1], m.rot[j + 2]);
+      const down = F3[2] < -0.05, len = down ? clamp((z - m.floorZ) / -F3[2], u * 4, m.radius * 3) : m.radius * 0.9, rad = len * tn;
+      r.cone(x, y, z, F3, R3, U3, len, rad, cr * 0.16, cg * 0.16, cb * 0.16);
+      if (down && z - m.floorZ > u) {
+        const fall = 0.32 / (1 + (len / m.radius) * (len / m.radius));
+        r.sprite(x + F3[0] * len, y + F3[1] * len, m.floorZ + 0.5, rad * 1.15, cr * fall, cg * fall, cb * fall, GL.POOL);
+      }
+      continue;
+    }
     if (k === KIND_LIGHT) {
       const ht = z - m.floorZ;
       if (ht > u) {
