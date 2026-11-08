@@ -2,6 +2,8 @@
 
 Serves the page in ../web and the JSON/binary API (docs/design.md "Preview server" and "Server endpoints added"):
   GET  /              page
+  GET  /preview       the same page as a view-only pop-out window: the 3D preview alone, following the main page
+                      (BroadcastChannel) and edits (/api/events); it never plays audio or writes anything
   GET  /api/state     metadata only: rig, notes, analysis summary (beats, bpm map; no peaks), bake outputs with key
                       counts (no values, no key lists), band ids, scene.json, live status, flash-safety flags
   GET  /api/curves    ?output=<id> | ?band=<id>, &lod=<n>: binary curve data (format below)
@@ -815,7 +817,7 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(url.query)
         st = self.state
         try:
-            if path == "/" or path == "/index.html":
+            if path in ("/", "/index.html", "/preview"):
                 return self._static("index.html", head)
             if path == "/api/state":
                 since = qs.get("since", [None])[0]

@@ -262,6 +262,27 @@ button.flashes:hover:not(:disabled) { background: rgba(216, 105, 91, 0.12); bord
 }
 #schem-tip::first-line { color: var(--text); font-weight: 600; }
 #schem-meters { display: block; width: 100%; border-top: 1px solid var(--line); }
+#schem-view.away { aspect-ratio: auto; }
+#schem-view.away > :not(#schem-away) { display: none !important; }
+#schem-away { padding: 16px 12px; }
+#schem-away button { height: 22px; }
+
+/* ------------------------------------------------------------------ pop-out window (/preview): the preview alone */
+.popout-only { display: none !important; }
+body.popout {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 40px minmax(0, 1fr);
+  grid-template-areas: "transport" "side";
+}
+body.popout .popout-only { display: flex !important; }
+body.popout #toolbar, body.popout #timeline, body.popout #status, body.popout #params, body.popout #agent,
+body.popout .edit-only, body.popout #popout, body.popout #scan, body.popout #help-panel { display: none !important; }
+body.popout #side { border-left: 0; }
+body.popout #schem { flex: 1 1 auto; min-height: 0; border-bottom: 0; }
+body.popout #schem-view, body.popout #schem-view.gl { aspect-ratio: auto; flex: 1 1 auto; min-height: 0; }
+body.popout .scrub { flex: 1 1 auto; }
+body.popout #pop-scrub { width: 100%; min-width: 120px; }
+#sync-info { font-size: 11px; }
 #scene-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 8px 4px 12px; border-top: 1px solid var(--line); }
 #scene-bar small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #scene-bar button { height: 20px; padding: 0 8px; }

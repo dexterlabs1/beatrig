@@ -192,6 +192,8 @@ def test_page_files_are_served_and_packaged():
             st, ctype, body = get_full(s.port, "/" + ref)
             assert st == 200 and body
             assert ctype.startswith("text/javascript" if ref.endswith(".js") else "text/css"), (ref, ctype)
+        st, ctype, popout = get_full(s.port, "/preview")                  # the pop-out window is the same page
+        assert st == 200 and ctype.startswith("text/html") and popout == html
     finally:
         s.close()
     pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")

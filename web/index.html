@@ -19,6 +19,8 @@
       <span class="tc-cell" title="Tempo at the playhead (notes.json bpm map)"><span id="bpm">-</span><small>bpm</small></span>
     </div>
   </div>
+  <div class="grp popout-only scrub"><input id="pop-scrub" type="range" min="0" max="1000" value="0" title="Playhead" aria-label="Playhead"></div>
+  <div class="grp popout-only"><span id="sync-info" class="dim" hidden></span></div>
   <div class="grp edit-only">
     <button id="click" class="tog" title="Metronome: click on every beat, accent on the downbeat (C)">Click</button>
     <input id="click-vol" type="range" min="0" max="1" step="0.01" value="0.5" title="Metronome volume" aria-label="Metronome volume">
@@ -110,6 +112,7 @@
       <span class="tabs" role="tablist">
         <button data-view="orbit" class="on" title="Orbit the scene: drag to turn, right-drag or Shift+drag to pan, wheel to zoom, double-click to frame (V cycles)">Orbit</button><button data-view="camera" title="Look through the scene camera (its forward axis)">Camera</button><button data-view="dome" title="Domemaster seen from the scene camera">Dome</button>
       </span>
+      <button id="popout" class="icon" title="Open the preview in its own window (for a second monitor): it follows this page's playhead and edits" aria-label="Open the preview in its own window"><svg viewBox="0 0 16 16" width="12" height="12"><path d="M9 1h6v6h-1.5V3.6L8.1 9 7 7.9l5.4-5.4H9zM2 3h5v1.5H3.5v8h8V10H13v4H2z"/></svg></button>
     </h2>
     <div id="schem-view">
       <canvas id="schem-canvas"></canvas>
@@ -118,6 +121,7 @@
       <div id="schem-hud" hidden><small id="schem-label"></small><button id="schem-fit" title="Frame the driven actors (or double-click the view)" hidden>Frame</button></div>
       <div id="schem-empty" class="empty" hidden><b></b><span></span></div>
       <div id="schem-tip" hidden></div>
+      <div id="schem-away" class="empty" hidden><span>The preview is open in its own window.</span><button id="schem-back">Show it here too</button></div>
     </div>
     <canvas id="schem-meters" hidden></canvas>
     <div id="scene-bar"><small id="scene-info" class="dim">no scene.json</small><button id="scan" title="Read actors, positions, components and the camera from the editor (needs the live link)">Scan</button></div>

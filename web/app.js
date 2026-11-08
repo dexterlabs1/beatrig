@@ -10,6 +10,9 @@ const audio = $("#audio");
 const timeline = $("#timeline");
 const lanesEl = $("#lanes");
 const playheadEl = $("#playhead");
+// The pop-out window (/preview, or ?view=preview) is this page in a view-only mode: the preview alone, no audio, no
+// edits and no writes to the editor. It follows the main page over a BroadcastChannel and edits over the event stream.
+const POPOUT = location.pathname.replace(/\/+$/, "") === "/preview" || new URLSearchParams(location.search).get("view") === "preview";
 
 // Colours and the UI font come from the CSS tokens (app.css :root), so the canvases and the chrome stay one system.
 const css = getComputedStyle(document.documentElement);
@@ -1350,6 +1353,7 @@ function drawSchem(force = true) {
   const t0 = performance.now();
   const f = frameOf(curT());
   if (f !== S.schemF) { S.schemF = f; schemFrameEl.textContent = `frame ${f}`; }
+  if (P3.away) return;                                               // shown in the pop-out window instead
   if (P3.r) { if (!draw3D(f, force)) return; }
   else {
     const want = schemHeight() + "px";
@@ -1537,7 +1541,7 @@ function setView3(v) {
   const views = P3.r ? VIEWS_GL : VIEWS_2D;
   if (!views.includes(v)) v = views[0];
   S.view3 = v;
-  lsSet("view3", v);
+  lsSet(POPOUT ? "view3:popout" : "view3", v);
   document.querySelectorAll("#schem .tabs button").forEach((b) => b.classList.toggle("on", b.dataset.view === v));
   S.geo = null;
   if (P3.r) { P3.dirty = true; P3.ovKey = ""; $("#schem-tip").hidden = true; hud3(); }
@@ -2423,7 +2427,7 @@ async function loadCurves() {
     const s = S.series.get(k);
     if (!s || s.hash !== o.hash) want.push([k, `/api/curves?output=${enc(o.id)}&lod=0`]);
   }
-  for (const b of S.bands || []) {
+  for (const b of POPOUT ? [] : S.bands || []) {                    // the pop-out has no band lanes
     const k = "b:" + b.id; keep.add(k);
     const s = S.series.get(k);
     if (!s || s.hash !== b.hash) want.push([k, `/api/curves?band=${enc(b.id)}&lod=0`]);
@@ -2557,7 +2561,13 @@ function zoomTo(pps, anchorX) {
   clampView(); syncZoomSlider(); schedule();
 }
 function zoomFit() { S.view.pps = fitPps(); S.view.t0 = S.tStart; syncZoomSlider(); schedule(); }
-const curT = () => (audio.paused ? S.pausedT : audio.currentTime);
+// The playhead: the audio element's clock; in the pop-out, the main page's clock (or its own silent one), extrapolated
+// from the last message so the pop-out draws at its own frame rate.
+const Remote = { playing: false, t0: 0, at: 0, rate: 1, main: false, mainAt: 0 };
+const playing = () => (POPOUT ? Remote.playing : !audio.paused);
+const curT = () => (POPOUT
+  ? (Remote.playing ? clamp(Remote.t0 + (performance.now() - Remote.at) * 0.001 * Remote.rate, S.tStart, S.duration) : S.pausedT)
+  : (audio.paused ? S.pausedT : audio.currentTime));
 let gutterW = 150;
 function placePlayhead() {
   const x = xOf(curT());
@@ -2586,6 +2596,7 @@ function onTimeChanged() {
   updateReadouts();
   placePlayhead();
   drawSchem(false);
+  if (POPOUT) popScrubShow();
 }
 function followTo(t) {
   if (!$("#follow").checked) return;
@@ -2595,14 +2606,23 @@ function followTo(t) {
 let raf = 0;
 function tick() {
   raf = 0;
-  if (audio.paused) return;
+  if (!playing()) return;
   const t0 = performance.now();
-  followTo(curT());
+  if (POPOUT) { if (!Remote.main && curT() >= S.duration) { popStop(S.duration); return; } }
+  else {
+    followTo(curT());
+    if (t0 - Pop.sentAt > 250) bcTime();
+  }
   onTimeChanged();
   perfPush(S.perf.tick, performance.now() - t0);
   raf = requestAnimationFrame(tick);
 }
+function setPlayGlyph(on) {
+  $("#play").classList.toggle("on", on);
+  $("#play-glyph").setAttribute("d", on ? "M4 2.5h3v11H4zM9 2.5h3v11H9z" : "M4 2.5v11l9-5.5z");
+}
 function togglePlay() {
+  if (POPOUT) return popToggle();
   if (audio.paused) {
     metroCtx();
     if (S.audioStale || Math.abs(audio.currentTime - S.pausedT) > 1e-3) { audio.currentTime = S.pausedT; S.audioStale = false; }
@@ -2610,30 +2630,31 @@ function togglePlay() {
   } else audio.pause();
 }
 audio.addEventListener("play", () => {
-  $("#play").classList.add("on");
-  $("#play-glyph").setAttribute("d", "M4 2.5h3v11H4zM9 2.5h3v11H9z");
+  setPlayGlyph(true);
   S.playStartT = curT();
   metroStart();
   pushPlayhead();
+  bcTime();
   if (!raf) raf = requestAnimationFrame(tick);
 });
 audio.addEventListener("pause", () => {
   S.pausedT = clamp(audio.currentTime, S.tStart, S.duration);
-  $("#play").classList.remove("on");
-  $("#play-glyph").setAttribute("d", "M4 2.5v11l9-5.5z");
+  setPlayGlyph(false);
   metroStop();
   endTake();
   pushPlayhead();
+  bcTime();
   onTimeChanged();
 });
-audio.addEventListener("seeked", () => { if (!audio.paused) metroStart(); });
+audio.addEventListener("seeked", () => { if (!audio.paused) { metroStart(); bcTime(); } });
 audio.addEventListener("error", () => msg("audio failed to load from /api/audio", true));
 function seek(t, fromEditor) {
+  if (POPOUT) return popSeek(t);
   t = clamp(t, S.tStart, S.duration);
   S.pausedT = t;
   if (fromEditor && audio.paused) S.audioStale = true;
   else { S.audioStale = false; try { audio.currentTime = t; } catch { S.audioStale = true; } }
-  if (audio.paused) onTimeChanged();
+  if (audio.paused) { onTimeChanged(); bcTime(); }
   if (!fromEditor) pushPlayhead();
 }
 // Seek on click; on the ruler and waveform also scrub while dragging.
@@ -2779,7 +2800,7 @@ function applyLive(st) {
   S.live = st;
   S.link = !!st.link_playhead;
   syncMute();
-  if (S.link && S.editorAudio == null && !S.audioProbe) {      // linked already (a reload): ask the editor once
+  if (S.link && S.editorAudio == null && !S.audioProbe && !POPOUT) {      // linked already (a reload): ask the editor once
     S.audioProbe = true;
     api("/api/playhead").then(editorAudio, () => {}).finally(() => { S.audioProbe = false; });
   }
@@ -2830,7 +2851,7 @@ function editorAudio(d) {
 function syncMute() { audio.muted = !!(S.link && S.editorAudio); }
 let phBusy = false, phNext = null;
 function pushPlayhead() {
-  if (!S.link) return;
+  if (!S.link || POPOUT) return;
   phNext = { frame: frameOf(curT()), playing: !audio.paused };
   S.lastPagePush = performance.now();
   if (phBusy) return;
@@ -2844,7 +2865,8 @@ function pushPlayhead() {
 }
 function onEditorPlayhead(d) {
   if (S.link) editorAudio(d);
-  if (!S.link || !audio.paused || d == null || d.frame == null) return;
+  if (!S.link || playing() || d == null || d.frame == null) return;
+  if (POPOUT && Remote.main) return;                                              // the main page drives the pop-out
   if (S.live.sequence && d.sequence && d.sequence !== S.live.sequence) return;    // another sequence is open: ignore it
   if (performance.now() - S.lastPagePush < 600) return;
   const t = tOfFrame(+d.frame);
@@ -2872,6 +2894,135 @@ $("#flash").onclick = () => {
   seek(Math.max(0, next - 0.5));
   if (xOf(next) < 0 || xOf(next) > S.width) { S.view.t0 = next - (S.width * 0.2) / S.view.pps; clampView(); schedule(); }
 };
+
+// ------------------------------------------------------------------------------------------- pop-out window sync
+// Main page -> pop-out: {type: "time", t, playing, rate} on play, pause and seek, every 250 ms while playing and in
+// answer to each pop-out heartbeat (the pop-out extrapolates in between). Pop-out -> main page: "hello", "popout"
+// heartbeats every 2 s (the main page folds its own preview away while a pop-out is open) and "cmd" toggle / seek: the
+// pop-out's transport drives the main page, which owns the audio, so the song is never heard twice. Edits reach the
+// pop-out through the server's event stream, like any other change. With no main page the pop-out plays silently.
+const Pop = { bc: null, sentAt: 0, open: false, at: 0, here: false, scrubF: null };
+try { Pop.bc = new BroadcastChannel("beatrig-preview"); } catch { /* no BroadcastChannel: no pop-out */ }
+function bcPost(m) { if (Pop.bc) { try { Pop.bc.postMessage(m); } catch { /* closed */ } } }
+function bcTime() {
+  if (!Pop.bc || POPOUT || !Pop.open) return;
+  Pop.sentAt = performance.now();
+  bcPost({ type: "time", t: curT(), playing: !audio.paused, rate: audio.playbackRate || 1 });
+}
+// main page: fold the preview away while a pop-out shows it ("Show it here too" keeps both)
+function setAway() {
+  const away = Pop.open && !Pop.here;
+  if (away === !!P3.away) return;
+  P3.away = away;
+  $("#schem-away").hidden = !away;
+  schemView.classList.toggle("away", away);
+  if (away) meterCv.hidden = true;
+  else { P3.meterKey = ""; P3.ovKey = ""; if (P3.r) sizeView3(); drawSchem(); }
+}
+function initMainSync() {
+  const btn = $("#popout");
+  if (!Pop.bc) { btn.disabled = true; btn.title = "This browser has no BroadcastChannel, so a pop-out window can't follow the page"; return; }
+  btn.onclick = () => {
+    const w = window.open("/preview", "beatrig-preview", "popup,width=1100,height=760");
+    if (!w) return msg("the browser blocked the pop-out window: allow pop-ups for this page", true);
+    w.focus();
+  };
+  Pop.bc.onmessage = (e) => {
+    const d = e.data || {};
+    if (d.type === "popout") {
+      if (d.open) { Pop.open = true; Pop.at = performance.now(); bcTime(); }
+      else { Pop.open = false; Pop.here = false; }
+      setAway();
+    } else if (d.type === "hello") { Pop.open = true; Pop.at = performance.now(); bcTime(); setAway(); }
+    else if (d.type === "cmd" && Pop.open) {
+      if (d.cmd === "toggle") togglePlay();
+      else if (d.cmd === "seek" && Number.isFinite(d.t)) { seek(d.t); followTo(curT()); }
+    }
+  };
+  // a pop-out that vanished without saying so (crashed, killed) stops counting after 6 s
+  setInterval(() => { if (Pop.open && performance.now() - Pop.at > 6000) { Pop.open = false; Pop.here = false; setAway(); } }, 2000);
+  $("#schem-back").onclick = () => { Pop.here = true; setAway(); };
+  window.addEventListener("pagehide", () => bcPost({ type: "bye" }));
+}
+// pop-out: follow the main page, or play on a silent clock of its own
+function initPopout() {
+  const info = $("#sync-info");
+  info.hidden = false;
+  const syncInfo = () => {
+    const t = Remote.main ? "following the main page" : "no main page open: plays silently";
+    if (info.textContent !== t) info.textContent = t;
+    info.title = Remote.main ? "Play, pause and seek here drive the main page, which plays the audio" : "Open the main page for sound: this window never plays audio";
+  };
+  Pop.syncInfo = syncInfo;
+  syncInfo();
+  if (Pop.bc) {
+    Pop.bc.onmessage = (e) => {
+      const d = e.data || {};
+      if (d.type === "time" && Number.isFinite(d.t)) {
+        Remote.main = true; Remote.mainAt = performance.now(); Remote.rate = d.rate || 1;
+        if (d.playing) {
+          Remote.t0 = d.t; Remote.at = performance.now();
+          if (!Remote.playing) { Remote.playing = true; setPlayGlyph(true); if (!raf) raf = requestAnimationFrame(tick); }
+        } else {
+          Remote.playing = false; setPlayGlyph(false);
+          S.pausedT = clamp(d.t, S.tStart, S.duration);
+          onTimeChanged();
+        }
+        syncInfo();
+      } else if (d.type === "bye") { Remote.main = false; popStop(curT()); syncInfo(); }
+    };
+    const beat = () => {
+      bcPost({ type: "popout", open: true });
+      // the main page answers every heartbeat; silence for 6 s means it is gone
+      if (Remote.main && performance.now() - Remote.mainAt > 6000) { Remote.main = false; popStop(curT()); syncInfo(); }
+    };
+    bcPost({ type: "hello" });
+    beat();
+    setInterval(beat, 2000);
+    window.addEventListener("pagehide", () => bcPost({ type: "popout", open: false }));
+  }
+  const scrub = $("#pop-scrub");
+  scrub.addEventListener("input", () => popSeek(S.tStart + (+scrub.value / 1000) * (S.duration - S.tStart)));
+  popScrubShow();
+}
+function popStop(t) {
+  Remote.playing = false;
+  S.pausedT = clamp(t, S.tStart, S.duration);
+  setPlayGlyph(false);
+  onTimeChanged();
+}
+function popToggle() {
+  if (Remote.main) return bcPost({ type: "cmd", cmd: "toggle" });
+  if (Remote.playing) return popStop(curT());
+  Remote.t0 = S.pausedT >= S.duration - 1e-3 ? S.tStart : S.pausedT;
+  Remote.at = performance.now(); Remote.rate = 1; Remote.playing = true;
+  setPlayGlyph(true);
+  if (!raf) raf = requestAnimationFrame(tick);
+}
+function popSeek(t) {
+  t = clamp(t, S.tStart, S.duration);
+  if (Remote.main) bcPost({ type: "cmd", cmd: "seek", t });
+  S.pausedT = t; Remote.t0 = t; Remote.at = performance.now();
+  if (!Remote.playing) onTimeChanged();
+}
+function popScrubShow() {
+  const scrub = $("#pop-scrub"), f = frameOf(curT());
+  if (f === Pop.scrubF || (mouseDown && document.activeElement === scrub)) return;
+  Pop.scrubF = f;
+  scrub.value = Math.round(((curT() - S.tStart) / Math.max(1e-6, S.duration - S.tStart)) * 1000);
+}
+// the pop-out's keys: Space, V, Home, Left / Right (Shift: a beat); nothing that edits
+function popKey(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === " ") { e.preventDefault(); popToggle(); }
+  else if (e.key.toLowerCase() === "v") cycleView3();
+  else if (e.key === "Home") popSeek(S.tStart);
+  else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    e.preventDefault();
+    const dir = e.key === "ArrowLeft" ? -1 : 1, t = curT();
+    popSeek(e.shiftKey ? timeAt(Math.round(beatAt(t)) + dir) : tOfFrame(frameOf(t) + dir) + 1e-4);
+  }
+}
 
 // ------------------------------------------------------------------------------------------- events (SSE)
 function connectEvents() {
@@ -2961,9 +3112,10 @@ $("#add-sec").onclick = () => addSection(snapT(curT()), true);
 $("#undo").onclick = () => undoRedo(S.undo, S.redo, "undo");
 $("#redo").onclick = () => undoRedo(S.redo, S.undo, "redo");
 $("#help").onclick = () => { $("#help-panel").hidden = !$("#help-panel").hidden; };
-for (const id of ["#snap", "#follow", "#grid", "#zoom", "#click-vol"]) $(id).addEventListener("keydown", (e) => { if (e.key === " ") e.preventDefault(); });
+for (const id of ["#snap", "#follow", "#grid", "#zoom", "#click-vol", "#pop-scrub"]) $(id).addEventListener("keydown", (e) => { if (e.key === " ") e.preventDefault(); });
 
 document.addEventListener("keydown", (e) => {
+  if (POPOUT) return popKey(e);
   const mod = e.ctrlKey || e.metaKey, key = e.key.toLowerCase();
   if (mod && key === "s") { e.preventDefault(); save(); return; }
   if (e.target instanceof Element && e.target.matches("input[type=number], input[type=text], textarea, select, #graph-form *")) return;
@@ -2999,7 +3151,7 @@ document.addEventListener("keydown", (e) => {
   else if (e.key === "\\") zoomFit();
   else if (e.key === "?") $("#help-panel").hidden = !$("#help-panel").hidden;
 });
-window.addEventListener("beforeunload", (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ""; } });
+window.addEventListener("beforeunload", (e) => { if (S.dirty && !POPOUT) { e.preventDefault(); e.returnValue = ""; } });
 // Buttons and checkboxes give focus back after a click, so Space always means play/pause
 // (a focused button would otherwise also activate on Space and toggle twice).
 document.addEventListener("click", (e) => {
@@ -3062,19 +3214,20 @@ function loadState(d, first) {
   onTimeChanged();
   renderActivity(d.activity || []);
   const pk = `${d.rig.audio}|${S.analysis.duration}|${S.analysis.sample_rate}`;
-  if (pk !== S.peaksKey) { S.peaksKey = pk; loadPeaks(); }
+  if (pk !== S.peaksKey && !POPOUT) { S.peaksKey = pk; loadPeaks(); }
 }
 async function boot() {
+  if (POPOUT) { document.body.classList.add("popout"); document.title = "beatrig preview"; }
   for (const k of ["ruler", "sections", "wave"]) canvases.add(document.querySelector(`canvas[data-kind="${k}"]`));
   attachSeek(document.querySelector('canvas[data-kind="ruler"]'), true);
   attachSeek(document.querySelector('canvas[data-kind="wave"]'), true);
   init3D();
-  setView3(lsGet("view3", "orbit"));
+  setView3(lsGet(POPOUT ? "view3:popout" : "view3", "orbit"));
   $("#click").classList.toggle("on", Metro.on);
   $("#rec-replace").classList.toggle("on", !!lsGet("replace", false));
   $("#rec-lat").value = lsGet("latency", 30);
   $("#live-seq").value = lsGet("sequence", "");
-  audio.src = "/api/audio";
+  if (!POPOUT) audio.src = "/api/audio";                            // the pop-out never plays sound
   try {
     const t0 = performance.now();
     const d = await api("/api/state");
@@ -3082,6 +3235,7 @@ async function boot() {
     S.seenRev = d.rev;
     loadState(d, true);
     msg(`loaded ${Object.keys(d.notes.tracks || {}).length} note tracks, ${(d.bake.outputs || []).length} outputs`);
+    if (POPOUT) initPopout(); else initMainSync();
   } catch (err) {
     msg("failed to load /api/state: " + err.message, true);
     showError(err.message);
