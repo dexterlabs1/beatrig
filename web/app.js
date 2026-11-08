@@ -11,13 +11,27 @@ const timeline = $("#timeline");
 const lanesEl = $("#lanes");
 const playheadEl = $("#playhead");
 
+// Colours and the UI font come from the CSS tokens (app.css :root), so the canvases and the chrome stay one system.
 const css = getComputedStyle(document.documentElement);
+const tok = (name, d) => css.getPropertyValue(name).trim() || d;
 const C = {
-  bg: "#111213", panel: "#161719", panel2: "#1b1c1f", line: "#24262a", line2: "#303237",
-  text: "#cdd0d5", dim: "#7b8089", faint: "#4b4f56", wave: "#6c717a",
-  accent: css.getPropertyValue("--accent").trim() || "#e2a23a", err: "#d26b5d",
-  note: "#a7abb2", pat: "#8796ab",
+  bg: tok("--bg", "#101112"), panel: tok("--surface", "#17181a"), panel2: tok("--surface-2", "#1c1d20"),
+  line: tok("--line", "#26282b"), line2: tok("--line-2", "#33363a"),
+  text: tok("--text", "#d6d8dc"), dim: tok("--dim", "#80858d"), faint: tok("--faint", "#50545a"), wave: tok("--wave", "#6d727a"),
+  accent: tok("--accent", "#e3a33b"), err: tok("--err", "#d8695b"),
+  note: tok("--note", "#aaaeb5"), pat: tok("--pat", "#8b97a8"),
+  font: tok("--font", "system-ui, sans-serif"),
   warm: [1.0, 0.62, 0.3],            // linear RGB of a lamp with no colour output
+};
+function alpha(hex, a) {              // "#rrggbb" + alpha -> rgba(); built once at load, not per draw
+  const n = parseInt(String(hex).replace("#", ""), 16) || 0x808080;
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+const F10 = `10px ${C.font}`, F11 = `11px ${C.font}`;
+const K = {
+  patSpan: alpha(C.pat, 0.07), patStrip: alpha(C.pat, 0.28), patLine: alpha(C.pat, 0.6), patBody: alpha(C.pat, 0.16),
+  selStrip: alpha(C.accent, 0.42), selBody: alpha(C.accent, 0.22), rows: alpha(C.accent, 0.55),
+  noteBody: alpha(C.note, 0.12), flash: alpha(C.err, 0.22),
 };
 const MAX_CANVAS_PX = 4096;
 const BEATS_PER_BAR = 4;             // design.md has no meter: 4/4 for downbeats, bar numbers and the metronome accent
@@ -150,9 +164,10 @@ function gridLines(w, sub) {
   return out;
 }
 function drawGrid(ctx, w, h, sub, strong = 1) {
+  const c2 = `rgba(150,155,165,${0.30 * strong})`, c1 = `rgba(150,155,165,${0.13 * strong})`, c0 = `rgba(150,155,165,${0.06 * strong})`;
   for (const g of gridLines(w, sub)) {
     if (g.x < -1 || g.x > w + 1) continue;
-    ctx.fillStyle = g.level === 2 ? `rgba(150,155,165,${0.30 * strong})` : g.level === 1 ? `rgba(150,155,165,${0.13 * strong})` : `rgba(150,155,165,${0.06 * strong})`;
+    ctx.fillStyle = g.level === 2 ? c2 : g.level === 1 ? c1 : c0;
     ctx.fillRect(Math.round(g.x), 0, 1, h);
   }
 }
@@ -402,14 +417,14 @@ function drawRuler(ctx, w, h) {
   const step = niceStep(70);
   const minor = step / 5;
   const t0 = Math.floor(tOf(0) / minor) * minor;
-  ctx.font = "11px Consolas, monospace";
+  ctx.font = F11;
   ctx.textBaseline = "top";
   for (let t = t0, i = 0; t <= tOf(w) && i < 2000; t += minor, i++) {
     const x = Math.round(xOf(t));
     const major = Math.abs(t / step - Math.round(t / step)) < 1e-6;
     ctx.fillStyle = major ? C.dim : C.faint;
     ctx.fillRect(x, major ? h - 9 : h - 4, 1, major ? 9 : 4);
-    if (major && t >= -1e-9) { ctx.fillStyle = C.dim; ctx.fillText(tLabel(Math.max(0, t), step), x + 3, 3); }
+    if (major && t >= -1e-9) { ctx.fillStyle = C.dim; ctx.fillText(tLabel(Math.max(0, t), step), x + 4, 4); }
   }
   // flash-safety windows from every output, as ticks along the ruler
   if (S.flags) {
@@ -421,7 +436,7 @@ function drawRuler(ctx, w, h) {
 const secLabelW = new Map();
 function secBoxes(ctx) {
   const out = [];
-  ctx.font = "11px Segoe UI, sans-serif";
+  ctx.font = F11;
   for (const s of sections()) {
     let tw = secLabelW.get(s.name);
     if (tw == null) { tw = ctx.measureText(s.name || "").width; secLabelW.set(s.name, tw); }
@@ -453,7 +468,7 @@ function drawWave(ctx, w, h) {
   ctx.fillStyle = C.bg; ctx.fillRect(0, 0, w, h);
   drawGrid(ctx, w, h, gridSize(), 1.2);
   drawSectionLines(ctx, w, h);
-  ctx.font = "10px Consolas, monospace"; ctx.textBaseline = "top"; ctx.fillStyle = C.faint;
+  ctx.font = F10; ctx.textBaseline = "top"; ctx.fillStyle = C.faint;
   let lastX = -1e9;
   for (const g of gridLines(w, 0)) if (g.level === 2 && g.x - lastX > 28 && g.x >= 0) {
     ctx.fillText(String(Math.round(g.beat / BEATS_PER_BAR) + 1), g.x + 3, 2); lastX = g.x;
@@ -471,7 +486,7 @@ function drawWave(ctx, w, h) {
       ctx.closePath(); ctx.fillStyle = C.wave; ctx.fill();
     }
   } else {
-    ctx.fillStyle = C.faint; ctx.font = "11px Segoe UI, sans-serif";
+    ctx.fillStyle = C.faint; ctx.font = F11;
     ctx.fillText("loading waveform", 8, h / 2);
   }
   // detected beats from the analysis: short ticks along the bottom edge (skipped when they would merge)
@@ -615,17 +630,17 @@ function drawNotes(ctx, w, h, track) {
   const E = S.ex[track];
   if (!E) return;
   // pattern copies: shaded span, strip with the pattern name and a link marker on every repeat
-  ctx.font = "10px Segoe UI, sans-serif"; ctx.textBaseline = "middle"; ctx.lineWidth = 1;
+  ctx.font = F10; ctx.textBaseline = "middle"; ctx.lineWidth = 1;
   for (const R of E.refs) {
     const x0 = xOf(R.t0), x1 = xOf(R.t1);
     if (x1 < 0 || x0 > w) continue;
     const sel = S.sel.has(R.obj);
-    ctx.fillStyle = "rgba(135,150,171,0.07)"; ctx.fillRect(x0, 0, x1 - x0, h);
-    ctx.fillStyle = sel ? "rgba(226,162,58,0.42)" : "rgba(135,150,171,0.28)"; ctx.fillRect(x0, 0, x1 - x0, STRIP);
+    ctx.fillStyle = K.patSpan; ctx.fillRect(x0, 0, x1 - x0, h);
+    ctx.fillStyle = sel ? K.selStrip : K.patStrip; ctx.fillRect(x0, 0, x1 - x0, STRIP);
     for (let r = 0; r < R.rep; r++) {
       const xa = xOf(pTimeAt(R.ab + r * R.L)), xb = xOf(pTimeAt(R.ab + (r + 1) * R.L));
       if (xb < 0 || xa > w) continue;
-      ctx.fillStyle = sel ? C.accent : "rgba(135,150,171,0.6)"; ctx.fillRect(Math.round(xa), 0, 1, h);
+      ctx.fillStyle = sel ? C.accent : K.patLine; ctx.fillRect(Math.round(xa), 0, 1, h);
       if (xb - xa > 34) {
         ctx.save(); ctx.beginPath(); ctx.rect(xa, 0, xb - xa - 2, STRIP); ctx.clip();
         ctx.strokeStyle = sel ? C.bg : C.text; drawLinkGlyph(ctx, xa + 3, 1.5);
@@ -633,7 +648,7 @@ function drawNotes(ctx, w, h, track) {
         ctx.restore();
       }
     }
-    ctx.fillStyle = sel ? C.accent : "rgba(135,150,171,0.6)"; ctx.fillRect(Math.round(x1) - 3, 0, 3, STRIP);   // repeat handle
+    ctx.fillStyle = sel ? C.accent : K.patLine; ctx.fillRect(Math.round(x1) - 3, 0, 3, STRIP);   // repeat handle
   }
   // hits: only the visible slice; aggregated per pixel column when there are more hits than pixels
   const pad = 4, H = h - pad * 2;
@@ -652,7 +667,7 @@ function drawNotes(ctx, w, h, track) {
     if (x + wpx < 0 || x > w) continue;
     const sel = S.sel.has(n.src), pat = !!n.ref;
     const vh = Math.max(2, clamp(n.vel, 0, 1) * H);
-    ctx.fillStyle = sel ? "rgba(226,162,58,0.22)" : pat ? "rgba(135,150,171,0.16)" : "rgba(167,171,178,0.12)";
+    ctx.fillStyle = sel ? K.selBody : pat ? K.patBody : K.noteBody;
     ctx.fillRect(x, pad + H - vh, wpx, vh);
     ctx.fillStyle = sel ? C.accent : pat ? C.pat : C.note;
     ctx.fillRect(Math.round(x), pad + H - vh, 2, vh);           // onset stem, height = velocity
@@ -1120,7 +1135,7 @@ function drawCurve(ctx, w, h, id) {
   drawSectionLines(ctx, w, h);
   const s = S.series.get("o:" + id);
   const n = o.channels.length;
-  if (!s) { ctx.fillStyle = C.faint; ctx.font = "11px Segoe UI, sans-serif"; ctx.textBaseline = "middle"; ctx.fillText("loading", 8, h / 2); return; }
+  if (!s) { ctx.fillStyle = C.faint; ctx.font = F11; ctx.textBaseline = "middle"; ctx.fillText("loading", 8, h / 2); return; }
   const lo = o.min ?? 0, hi = o.max ?? 1;
   if (color) drawColors(ctx, s, w, h);
   else if (S.stacked.has(id) && n > 1) {
@@ -1128,7 +1143,7 @@ function drawCurve(ctx, w, h, id) {
     for (let i = 0; i < n; i++) {
       const top = i * rowH;
       ctx.fillStyle = C.line; ctx.fillRect(0, Math.round(top + rowH) - 1, w, 1);
-      drawValues(ctx, s, i, w, top + 1.5, rowH - 3, lo, hi, "rgba(226,162,58,0.55)", true);
+      drawValues(ctx, s, i, w, top + 1.5, rowH - 3, lo, hi, K.rows, true);
     }
   } else {
     ctx.globalAlpha = n > 1 ? 0.75 : 1;
@@ -1140,7 +1155,7 @@ function drawCurve(ctx, w, h, id) {
   if (fl) for (const [a, b] of fl) {
     const x0 = xOf(a), x1 = xOf(b);
     if (x1 < 0 || x0 > w) continue;
-    ctx.fillStyle = "rgba(210,107,93,0.22)"; ctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
+    ctx.fillStyle = K.flash; ctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
     ctx.fillStyle = C.err; ctx.fillRect(x0, 0, Math.max(1, x1 - x0), 2);
   }
   shadeEnd(ctx, w, h);
@@ -1350,7 +1365,7 @@ function drawRing(ctx, w, f) {
     const n = o.channels.length;
     if (o.channels.some((c) => c.actor) && (o.target || {}).kind !== "transform") {
       const cx = w / 2, cy = y + 74, R = 52;
-      ctx.font = "11px Segoe UI, sans-serif"; ctx.fillStyle = C.dim; ctx.textAlign = "left";
+      ctx.font = F11; ctx.fillStyle = C.dim; ctx.textAlign = "left";
       ctx.fillText(o.id, 10, y + 6);
       ctx.textAlign = "right"; ctx.fillStyle = C.faint;
       ctx.fillText(col ? "colour" : (o.target.property || o.target.param || ""), w - 10, y + 6);
@@ -1370,15 +1385,15 @@ function drawRing(ctx, w, f) {
         ctx.beginPath(); ctx.arc(x, yy, n > 24 ? 4 : 8, 0, Math.PI * 2); ctx.fill();
         ctx.strokeStyle = C.line2; ctx.stroke();
       }
-      ctx.textAlign = "center"; ctx.fillStyle = C.dim; ctx.font = "11px Consolas, monospace";
+      ctx.textAlign = "center"; ctx.fillStyle = C.dim; ctx.font = F11;
       if (s && !col) ctx.fillText(fmtVal(sum / (n || 1)), cx, cy);
       y += 150;
     } else {
       const label = (o.target && (o.target.param || o.target.property)) || o.id;
-      ctx.font = "11px Segoe UI, sans-serif"; ctx.textAlign = "left"; ctx.fillStyle = C.dim;
+      ctx.font = F11; ctx.textAlign = "left"; ctx.fillStyle = C.dim;
       ctx.fillText(label, 10, y + 10);
       const bx = 84, bw = w - bx - 64;
-      ctx.textAlign = "right"; ctx.fillStyle = C.text; ctx.font = "11px Consolas, monospace";
+      ctx.textAlign = "right"; ctx.fillStyle = C.text; ctx.font = F11;
       if (s && col) {
         s.rgba(0, f, CB);
         ctx.fillStyle = rgbCss(toSRGB(CB[0], CB[1], CB[2], C8)); ctx.fillRect(bx, y + 4, bw, 12);
@@ -1470,7 +1485,7 @@ function sceneGeo(w, h, mode) {
 }
 function drawSpace(ctx, w, h, f, mode) {
   const g = sceneGeo(w, h, mode);
-  ctx.font = "11px Segoe UI, sans-serif"; ctx.textBaseline = "middle";
+  ctx.font = F11; ctx.textBaseline = "middle";
   if (g.note) { ctx.fillStyle = C.dim; ctx.textAlign = "center"; ctx.fillText(g.note, w / 2, h / 2); ctx.textAlign = "left"; return; }
   if (mode === "dome") {
     ctx.strokeStyle = C.line2; ctx.lineWidth = 1;
@@ -2061,9 +2076,14 @@ function placePlayhead() {
 }
 const RO = { sec: $("#t-sec"), frame: $("#t-frame"), beat: $("#t-beat"), bpm: $("#bpm") };
 function setText(el, s) { if (el.textContent !== s) el.textContent = s; }
+// audio time as m:ss.mmm (minutes keep counting past 59, so a 75-minute show reads 75:03.250)
+function clockText(t) {
+  const ms = Math.max(0, Math.round(t * 1000)), m = Math.floor(ms / 60000), r = ms - m * 60000;
+  return `${m}:${String(Math.floor(r / 1000)).padStart(2, "0")}.${String(r % 1000).padStart(3, "0")}`;
+}
 function updateReadouts() {
   const t = curT();
-  setText(RO.sec, t.toFixed(3));
+  setText(RO.sec, clockText(t));
   setText(RO.frame, String(frameOf(t)));
   const b = beatAt(t);
   if (b >= 0) {
@@ -2375,8 +2395,16 @@ function connectEvents() {
   });
   es.addEventListener("live", (e) => applyLive(JSON.parse(e.data)));
   es.addEventListener("playhead", (e) => onEditorPlayhead(JSON.parse(e.data)));
-  es.onopen = () => { if ($("#msg").textContent.startsWith("lost the server")) msg("reconnected"); };
-  es.onerror = () => { if (es.readyState !== EventSource.OPEN) msg("lost the server; reconnecting", true); };
+  const conn = $("#conn");
+  es.onopen = () => {
+    conn.textContent = "connected"; conn.classList.remove("lost");
+    if ($("#msg").textContent.startsWith("lost the server")) msg("reconnected");
+  };
+  es.onerror = () => {
+    if (es.readyState === EventSource.OPEN) return;
+    conn.textContent = "reconnecting"; conn.classList.add("lost");
+    msg("lost the server; reconnecting", true);
+  };
 }
 let mouseDown = false;
 window.addEventListener("mousedown", () => { mouseDown = true; }, true);
@@ -2409,7 +2437,7 @@ function renderActivity(list) {
   const ol = $("#agent-list");
   ol.textContent = "";
   const recent = list.slice(-5).reverse();
-  if (!recent.length) { ol.innerHTML = '<li class="dim">No agent activity yet</li>'; return; }
+  if (!recent.length) { ol.innerHTML = '<li class="empty-row">No agent activity yet. Changes an agent makes over MCP show up here.</li>'; return; }
   for (const a of recent) {
     const li = document.createElement("li");
     if (a.rev > (S.seenRev || 0)) li.className = "fresh";
@@ -2507,6 +2535,7 @@ new ResizeObserver(() => {
 const baseName = (p) => (p || "").split(/[\\/]/).pop();
 // Apply a full /api/state snapshot. On a reload (agent change) the view, zoom and playhead are kept.
 function loadState(d, first) {
+  $("#boot-error").hidden = true;
   S.rig = d.rig; S.notes = d.notes; S.analysis = d.analysis || {}; S.scene = d.scene || null;
   S.lastGood = { rig: deep(d.rig), notes: deep(d.notes) };
   S.opParams = d.op_params || {};
@@ -2554,6 +2583,7 @@ async function boot() {
   $("#rec-replace").classList.toggle("on", !!lsGet("replace", false));
   $("#rec-lat").value = lsGet("latency", 30);
   $("#live-seq").value = lsGet("sequence", "");
+  audio.src = "/api/audio";
   try {
     const t0 = performance.now();
     const d = await api("/api/state");
@@ -2564,6 +2594,8 @@ async function boot() {
   } catch (err) {
     msg("failed to load /api/state: " + err.message, true);
     showError(err.message);
+    $("#boot-error-msg").textContent = err.message;
+    $("#boot-error").hidden = false;
   }
   connectEvents();
 }
