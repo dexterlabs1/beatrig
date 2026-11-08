@@ -265,12 +265,12 @@ def op_const(node, ins, ctx):
 
 
 # ---------- shaping
-@op("normalize", {"range_db": 24, "hi_pct": 99.5, "lo_pct": 10, "ref_db": None})
+@op("normalize", {"range_db": 24, "hi_pct": 99.5, "lo_pct": 10, "ref_db": None, "floor_db": None})
 def op_normalize(node, ins, ctx):
     s = ins[0]
-    ref = node.get("ref_db")
+    ref, flo = node.get("ref_db"), node.get("floor_db")
     v, _, _ = norm_db(s.v.ravel(), float(P(node, "range_db")), float(P(node, "hi_pct")), float(P(node, "lo_pct")),
-                      None if ref is None else float(ref))
+                      None if ref is None else float(ref), None if flo is None else float(flo))
     return Signal(v.reshape(s.v.shape), "value", s.hits)
 
 

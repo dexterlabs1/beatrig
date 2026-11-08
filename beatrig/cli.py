@@ -270,7 +270,7 @@ def cmd_pin_levels(a):
     raw = json.load(open(a.rig, encoding="utf-8"))
     want = set(a.nodes.split(",")) if a.nodes else None
     n = 0
-    print(f"{'node':16} {'input':16} {'ref_db':>8}")
+    print(f"{'node':16} {'input':16} {'ref_db':>8} {'floor_db':>9}")
     for node in raw.get("nodes", []):
         if node.get("op") != "normalize" or (want and node["id"] not in want):
             continue
@@ -280,9 +280,10 @@ def cmd_pin_levels(a):
         src = node["in"] if isinstance(node["in"], str) else node["in"][0]
         P_ = {"range_db": 24, "hi_pct": 99.5, "lo_pct": 10}
         P_.update({k: node[k] for k in P_ if k in node})
-        _, _, hi = norm_db(sig[src].v.ravel(), P_["range_db"], P_["hi_pct"], P_["lo_pct"])
-        node["ref_db"] = round(hi, 2)
-        print(f"{node['id']:16} {src:16} {node['ref_db']:>8}")
+        _, lo, hi = norm_db(sig[src].v.ravel(), P_["range_db"], P_["hi_pct"], P_["lo_pct"])
+        node["ref_db"] = round(hi, 4)
+        node["floor_db"] = round(lo, 4)
+        print(f"{node['id']:16} {src:16} {node['ref_db']:>8} {node['floor_db']:>9}")
         n += 1
     if n and not a.dry_run:
         with open(a.rig, "w", encoding="utf-8", newline="\n") as f:

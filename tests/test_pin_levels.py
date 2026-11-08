@@ -24,6 +24,14 @@ def test_norm_db_ref_is_a_fixed_scale():
     assert np.allclose(c, d)
 
 
+def test_pinned_scale_equals_the_percentile_scale_when_the_floor_binds():
+    x = 0.05 + 0.01 * np.abs(np.sin(np.linspace(0, 30, 5000)))     # ~2 dB of range: the lo_pct floor binds, not range_db
+    v, lo, hi = A.norm_db(x, 30)
+    assert lo > hi - 30
+    w, _, _ = A.norm_db(x, 30, ref_db=hi, floor_db=lo)
+    assert np.allclose(v, w)
+
+
 def _rig(folder, audio):
     rig = {"audio": audio, "fps": 30, "frames": None, "seed": 1, "nodes": [
         {"id": "loud_raw", "op": "loudness", "attack_ms": 15, "release_ms": 200},
