@@ -255,7 +255,9 @@ def test_availability_check_imports_nothing():
             "print(ok, 'torch' in sys.modules, why)") % ROOT
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
-    assert out.stdout.startswith("False False beat-this is not installed")
+    # a core install reports torch first; with torch present, the hidden beat-this
+    assert out.stdout.startswith("False False "), out.stdout
+    assert "is not installed: pip install beatrig[ml]" in out.stdout, out.stdout
 
 
 # ---------- the front end
