@@ -258,6 +258,40 @@ def cmd_bake(a):
     return 0
 
 
+def cmd_pin_levels(a):
+    """write each normalize node's current top level (dB) into the rig as ref_db, so the scale stops following the
+    audio: a louder mix (a remix, a new master) then drives harder instead of being normalised back"""
+    import json
+    from .analysis import norm_db
+    from .bake import evaluate
+    rig = load_rig(a.rig)
+    an = analyze(rig)
+    sig = evaluate(rig, an)
+    raw = json.load(open(a.rig, encoding="utf-8"))
+    want = set(a.nodes.split(",")) if a.nodes else None
+    n = 0
+    print(f"{'node':16} {'input':16} {'ref_db':>8}")
+    for node in raw.get("nodes", []):
+        if node.get("op") != "normalize" or (want and node["id"] not in want):
+            continue
+        if node.get("ref_db") is not None and not a.force:
+            print(f"{node['id']:16} {'(pinned)':16} {node['ref_db']:>8}")
+            continue
+        src = node["in"] if isinstance(node["in"], str) else node["in"][0]
+        P_ = {"range_db": 24, "hi_pct": 99.5, "lo_pct": 10}
+        P_.update({k: node[k] for k in P_ if k in node})
+        _, _, hi = norm_db(sig[src].v.ravel(), P_["range_db"], P_["hi_pct"], P_["lo_pct"])
+        node["ref_db"] = round(hi, 2)
+        print(f"{node['id']:16} {src:16} {node['ref_db']:>8}")
+        n += 1
+    if n and not a.dry_run:
+        with open(a.rig, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(raw, f, indent=1)
+            f.write("\n")
+    print(f"pinned    {n} node(s){' (dry run, rig unchanged)' if a.dry_run else ''}")
+    return 0
+
+
 def cmd_check(a):
     rig = load_rig(a.rig)
     notes = load_notes(rig.notes_path)
@@ -378,6 +412,12 @@ def main(argv=None):
     p.add_argument("rig")
     p.add_argument("--out")
     p.set_defaults(fn=cmd_bake)
+    p = sub.add_parser("pin-levels", help="pin each normalize node's level (ref_db) from this rig's audio, so a louder mix drives harder")
+    p.add_argument("rig")
+    p.add_argument("--nodes", help="comma-separated normalize node ids (default: all)")
+    p.add_argument("--force", action="store_true", help="re-pin nodes that already have ref_db")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_pin_levels)
     p = sub.add_parser("check", help="validate the rig (and, unless --static, bake in memory for the flash-safety rule)")
     p.add_argument("rig")
     p.add_argument("--static", action="store_true", help="skip the bake (no audio needed)")

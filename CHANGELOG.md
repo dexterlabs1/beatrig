@@ -5,6 +5,11 @@ project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- `normalize` `ref_db`: a fixed level scale (ref_db -> 1, ref_db - range_db -> 0) instead of the bake's own
+  percentiles, so a louder mix drives harder. `beatrig pin-levels <rig>` writes each node's current top as `ref_db`
+  (the bake on that audio is unchanged).
+
 ### Fixed
 - Preview page: with the playhead linked to a sequence that has its own audio track, the page mutes itself, so the
   music isn't heard twice. `playhead_get` reports `audio`.

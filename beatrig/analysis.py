@@ -131,10 +131,15 @@ def time_to_frame(t, fps, offset=0, t0=0.0):
     return (np.ceil(np.round((np.asarray(t, np.float64) - float(t0)) * fps, 4)).astype(np.int64) + int(offset))
 
 
-def norm_db(v, range_db, hi_pct=99.5, lo_pct=10):
+def norm_db(v, range_db, hi_pct=99.5, lo_pct=10, ref_db=None):
     """0..1 on a dB scale over the whole range: hi_pct -> 1, floor = max(lo_pct, top - range_db) -> 0.
-    A static gain only: timing is unaffected."""
+    With ref_db (dB of the raw signal, e.g. pinned from a reference mix) the scale is fixed instead: ref_db -> 1 and
+    ref_db - range_db -> 0, so a louder mix reads higher. A static gain only: timing is unaffected."""
     d = 20 * np.log10(np.maximum(np.asarray(v, np.float64), 1e-7))
+    if ref_db is not None:
+        hi = float(ref_db)
+        lo = hi - max(float(range_db), 1.0)
+        return np.clip((d - lo) / (hi - lo), 0, 1), lo, hi
     hi = np.percentile(d, hi_pct)
     lo = max(np.percentile(d, lo_pct), hi - range_db)
     if hi - lo < 1:
