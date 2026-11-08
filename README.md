@@ -34,7 +34,7 @@ git clone https://github.com/dexterlabs1/beatrig
 cd beatrig
 python -m venv .venv
 . .venv/bin/activate              # Windows: .venv\Scripts\activate
-pip install -e .                  # core: numpy, scipy, soundfile. Extras: [mcp], [stems] (Demucs + torch), [dev]
+pip install -e .                  # core: numpy, scipy, soundfile. Extras: [mcp], [stems] (Demucs), [ml] (neural beats), [dev]
 
 python examples/make_demo_audio.py                   # first: writes the demo audio (a synthetic 110 BPM loop)
 beatrig analyze examples/ring-demo/rig.json          # tempo, beat grid, analysis cache
@@ -43,6 +43,25 @@ beatrig serve examples/ring-demo/rig.json           # preview page on http://127
 ```
 
 `python -m beatrig ...` works the same as the `beatrig` command.
+
+### Better ears (optional, a GPU helps)
+
+```bash
+pip install -e ".[stems,ml]"      # Demucs stem separation + the Beat This! beat and downbeat tracker (both torch)
+```
+
+Install a CUDA build of torch first (pytorch.org) if you have an NVIDIA GPU. With the extras, `analyze` by default:
+
+- separates drums / bass / vocals / other once and caches them next to the audio (on a CUDA GPU; about 5 s for a
+  4.5-minute track on an RTX 5090). Drum parts and the song structure then read the stems;
+- tracks beats and downbeats with a neural model (1.4 s on that GPU, about 3 s on a desktop CPU), and keeps a beat only
+  where a real onset supports it, at the onset's time;
+- labels the song's sections on bar lines (`beatrig notes sections init`).
+
+Without the extras (or a GPU, for separation) the analysis runs as before and says what it fell back to. `beat-this`
+pulls in `torchaudio`, which beatrig never imports, so a torch build newer than any torchaudio wheel still works
+(pip adds torchaudio 2.11 next to torch 2.14 without touching torch). `BEATRIG_EXTRAS=off` makes the defaults behave
+like a core install.
 
 The ring demo drives eight lights with a kick-triggered chase, a material glow on eight orbs with a beat-locked wave,
 and a global parameter-collection glow that follows the loudness. Two layers crossfade into the breakdown and back.
@@ -62,9 +81,9 @@ The server's tools ([full reference](docs/mcp.md)):
 
 | Step | Tools |
 |---|---|
-| Hear the song (an agent can't listen) | `analyze` (tempo, beats, which frequency bands carry clear hits), `describe_audio` (per-bar energy per band, candidate section boundaries) |
+| Hear the song (an agent can't listen) | `analyze` (tempo, beats, bars, which frequency bands carry clear hits, whether stems were used), `describe_audio` (per-bar energy per band, candidate boundaries, labelled sections) |
 | Build and tweak the rig | `list_ops`, `get_rig`, `add_node`, `set_node`, `remove_node`, `set_output`, `remove_output`, `set_layer`, `check` |
-| Edit the hits | `notes_init` (from a band, onsets or the beat grid), `get_notes`, `notes_edit` (add / move / delete / velocity), `notes_snap` |
+| Edit the hits | `notes_init` (from a band, onsets, the beat grid, the bar lines or a drum part: kick / snare / hats), `get_notes`, `notes_edit` (add / move / delete / velocity), `notes_snap` |
 | Bake and look | `bake` (per-output stats and key counts), **`plot`** |
 | Show the human | `preview_url`, `preview_start` |
 | Write into Unreal | `ue_apply`, `ue_check`, `ue_undo` |
@@ -116,8 +135,9 @@ targets.
 - **Signals** are `float32[channels, frames]`, usually 0..1. A **trigger** is a signal that is non-zero only on hit
   frames, and its value is the hit's velocity. **Channels** let one node drive many targets: a `chase` turns one
   signal into eight delayed copies, `cycle` deals hits round a ring, `ripple` spreads a hit to its neighbours.
-- **Nodes** are ops (39 of them): sources (`band`, `loudness`, `onsets`, `beats`, `notes`, `lfo`, `const`; bands and
-  onsets can read a separated stem), shaping (`normalize`, `smooth`, `spring`, `curve`, `remap`, `threshold`,
+- **Nodes** are ops (40 of them): sources (`band`, `loudness`, `onsets`, `beats`, `drum`, `notes`, `lfo`, `const`;
+  bands and onsets can read a separated stem, `drum` gives kick, snare or hats hits with no band to tune, `beats` can
+  count on real bars), shaping (`normalize`, `smooth`, `spring`, `curve`, `remap`, `threshold`,
   `envelope`, `delay`, `math`, `hold`, `accumulate`, `flash_limit`), per-hit flow (`push`, `shuffle_hits`, `every_n`,
   `probability`, `quantize`), channel ops (`fanout`, `chase`, `cycle`, `ripple`, `mirror`, `reverse`, `select`,
   `merge`, `shuffle`), colour (`gradient`, `palette_cycle`, `mix_color`, `scale_color`) and spatial ops that read real
@@ -244,8 +264,9 @@ at runtime from tick time can't promise that.
 
 ## Status
 
-v0.3.0. The test suite (134 tests) passes on Windows with Python 3.14; CI runs it on Ubuntu and Windows with Python
-3.11 and 3.12. The CLI, preview page, MCP server and live link have been run by hand on Windows against UE 5.8.3.
+v0.3.0, plus the unreleased additions in the changelog. The test suite (162 tests) passes on Windows with Python 3.11
+with every extra installed and a CUDA GPU; CI runs it on Ubuntu and Windows with Python 3.11 and 3.12 (core only, so
+the GPU and real-model tests skip). The CLI, preview page, MCP server and live link have been run by hand on Windows against UE 5.8.3.
 
 | Part | Status |
 |---|---|
@@ -258,7 +279,9 @@ v0.3.0. The test suite (134 tests) passes on Windows with Python 3.14; CI runs i
 | Live link, scan, playhead sync | Tested live in UE 5.8.3; timings above. Unit tests run against a fake Remote Control server |
 | `ue_apply` / `ue_check` / `ue_undo` / `ue_scan` / `live_push` over MCP | Run by hand against UE 5.8.3 |
 | Niagara targets | Track, parameter name and keys verified; the value reaching a running system has not been checked (no template declares a user parameter) |
-| Stems | Tested on CUDA (RTX 5090) and in unit tests; downloads the Demucs model on first use |
+| Stems | Tested on CUDA (RTX 5090) and in unit tests (faked stems, no torch); on by default with the extra and a GPU; downloads the Demucs model on first use |
+| Neural beats and bars | Tested in unit tests (mocked activations) and on CUDA with the real model on the demo; measured on a 4.5-minute house track: every beat within 7 ms of the true grid, downbeat F-measure 0.99 (the classic grid gives no downbeats); downloads the model on first use |
+| Drum parts, song structure | Tested on synthetic drums and songs with exact truth; numbers for one real track in the changelog |
 | 60-minute show | Measured: fresh analysis 28 s, 356 MB peak; bake 4.1 s |
 | Linux | Test suite passes in CI; CLI, page and MCP server not tried by hand |
 | macOS | Not tried yet |

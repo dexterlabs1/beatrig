@@ -12,8 +12,10 @@ an AI agent can drive every step over MCP. A local preview page lets a human see
 2. **Eased motion**. Continuous signals are smoothed/slewed. Only trigger envelopes
    may rise instantly (on-beat hits). Keys are written linear, so tangents can't overshoot.
 3. **Deterministic.** The same inputs give byte-identical bake output. Seeds are explicit. There is no wall-clock time.
-4. **Light machine load.** CPU only. No torch/demucs install in v0 (stems are a later phase, CPU and opt-in). Run heavy
-   loops vectorised; a 60-min show must bake in under ~60 s.
+4. **Light core, heavy ears optional.** The core install is numpy, scipy and soundfile, CPU only, and never imports
+   torch. The optional extras ([stems]: Demucs; [ml]: the Beat This! tracker) use torch and a GPU when there is one;
+   their work happens once, in the analysis, and is cached. Run heavy loops vectorised; a 60-min show must bake in
+   under ~60 s.
 5. Clean-room: all code is original.
 
 ## Files (all JSON, all hand-editable, all relative paths resolved from the rig file's folder)
@@ -111,7 +113,8 @@ Every editing action the UI offers maps to this file.
 - Bands are computed on demand per (lo, hi, attack, release) and cached in the npz.
 - Onset function: octave-band spectral flux, hop 5 ms.
 - Beat grid: tempo estimate + verified beats. A beat exists only where a real onset peak supports it, and the period must
-  hold across windows (onset autocorrelation vs a shuffled null). Output: beat times, confidence, bpm map.
+  hold across windows (onset autocorrelation vs a shuffled null). Output: beat times, confidence, bpm map. With the
+  [ml] extra the beats come from a neural tracker, verified the same way (see the unreleased additions below).
 
 ## CLI (`py -3 beatrig.py ...`)
 - `analyze <rig>`: build or refresh the cache and print a summary (bpm, beats, duration).
@@ -285,3 +288,50 @@ existing animation in the sequence (its "base"):
 - Timeline import records each clip's source in-point and adjacent transitions, sets `audio_offset_frames` = source in,
   and with `--handles N` bakes only the clip plus N frames each side (`bake.start_frame` = max(0, source_in − N)),
   never the other clips' audio before it.
+
+## Unreleased contract additions (better ears)
+
+### Neural beats and bars
+- `rig.analysis.beats` = `auto` (default: neural when the [ml] extra is installed) | `neural` | `classic`. Without the
+  extra the classic grid runs unchanged.
+- The model (Beat This!, MIT) only proposes. A beat is written **only at a real onset** of the octave-band onset
+  function within 0.14 periods of a model beat, **at that onset's time** ((k + 1) × 5 ms, when the rise is known),
+  never at the model's frame. Rule 1 holds as for the classic grid: no beat is ahead of its sound.
+- Bars: a skeleton of the model's beats (gaps filled, unsupported beats kept) counts them; a Viterbi phase over the
+  downbeat activations gives each written beat `bar` and `pos` (0 = downbeat). Beats without an onset keep their
+  number, so bar counting never slips. analysis.json carries `bars` {meter, downbeats, first_downbeat, confidence}.
+- The analysis grid offset becomes the first downbeat's phase within a bar, so the tempo map's beat 0, meter, ... are
+  downbeats (patterns at multiples of the meter land on bars).
+- `beats` op `anchor`: `first` (default, v0.3 counting along the list) | `bar` (every/offset on the bar grid; offset is
+  a phase in the bar). Without bars, `bar` counts the tempo map's beats from the grid offset.
+- Determinism: GPU inference is not bit-reproducible, so a bake's determinism rests on the analysis cache (as it
+  always did). Beats sit on the 5 ms onset grid, so a re-analysis changes one only when a model peak sits at the
+  threshold. A neural cache is reused on a machine without the extra; a classic cache made because the extra was
+  missing is rebuilt once it arrives.
+
+### Stems by default
+- `rig.analysis.stems` = `auto` (default: use cached stems; separate once when [stems] and a CUDA GPU are there) |
+  `on` (separate on any device) | `off` (only nodes that name a stem read one). Not part of the mix's cache key.
+- Each stem has its own analysis cache folder (`<stem>.analysis/` next to the stem wav). A stem's analysis has no beat
+  grid. When stem features fall back to the mix, the analysis summary says so and why.
+- Separation looks at whole segments of audio (offline, as before); stems carry ~90 ms of pre-echo.
+
+### Drum parts
+- `drum` op: `part` kick | snare | hats, `source` auto (drums stem when present, else the mix) | stem | mix. Bands and
+  defaults are built in; pre-echo is removed; snare and hats are told from kick clicks and clap tails by how the hit
+  rings on over the next 10-80 ms. That look-ahead is an **offline choice** (like `flash_limit` `strongest`): whether
+  a hit counts may depend on up to 80 ms after it, but a kept hit lands on the first frame at or after its own onset,
+  never earlier.
+
+### Song structure
+- `song_structure(analysis)` and `notes sections init` (default; `--method energy` keeps v0.2): sections start on bar
+  lines (downbeats when known), from a multi-scale contrast novelty over per-bar stem levels, drum-part densities and
+  band levels, plus drums/bass presence changes and one-bar drop-outs; labels from what plays (`intro`, `groove`,
+  `dip`, `build`, `breakdown`, `break`, `drop`, `outro`, numbered repeats). The novelty compares bars on both sides of a
+  line (offline, like `normalize`'s statistics); a section's time is its bar line, so a layer key naming it never
+  fades before the music changes.
+
+### Tempo line fit (a fix)
+- The classic grid's tempo is a line fit through its beats with each beat indexed by the periods between neighbours
+  (round(interval / T)), not by round((t − t0) / T), which let the 5 ms-quantised comb period bend the slope on long
+  passages. Analysis version 5.

@@ -1,4 +1,4 @@
-# beatrig ops reference (v0.3)
+# beatrig ops reference (v0.3, with the unreleased additions)
 
 The file formats are specified in [the design doc](design.md). This page is the op-by-op reference, plus the semantics
 the engine settles where the design doc leaves room. Params in brackets are optional (shown with their defaults).
@@ -22,7 +22,8 @@ keep. Sources set it, delays and chases move it, `math` unions it, and shaping o
 | `band` | `lo`, `hi` (Hz), [`attack_ms` 10, `release_ms` 150, `weights` null, `stem` null] | 1 ch, raw linear amplitude | Butterworth band (order 4, low/high-pass at the edges). Per-channel power is weighted and summed, so channels can't phase-cancel. Then a one-pole follower runs on an exact 1 ms grid, sampled at each frame's start. `weights` (one per audio channel) defaults to the rig's `channel_weights`, else equal. `stem` (`drums`, `bass`, `vocals`, `other`) reads a separated stem instead of the mix (see Stems). |
 | `loudness` | [`attack_ms` 10, `release_ms` 150, `weights`, `stem`] | 1 ch | Same as `band`, with the ITU-R BS.1770 K-weighting filter (computed for any sample rate). |
 | `onsets` | [`in`, `threshold` 0.3, `min_gap_ms` 80, `stem`] | trigger, 1 ch | Causal spectral-flux peaks on a 5 ms grid. `in` is a `band` node id, an inline `{lo, hi}`, or omitted for the full-range octave-band flux. Velocity is the peak relative to the 95th percentile of all peaks. Peaks below `threshold` are dropped. The onset time is when the rise is known (`(k+1)·5 ms`). The stem is the node's own `stem`, else the referenced band's. |
-| `beats` | [`every` 1, `offset` 0, `subdivide` 1, `min_confidence` 0, `velocity` strength] | trigger, 1 ch | The **verified** beat grid from the analysis. Beats exist only where a real onset supports them. `offset` is an index offset into the beat list for `every`. `subdivide` inserts evenly spaced hits sized from the **previous** interval (causal), never past the next real beat. Subdivision velocity is 0.6 × the beat's. `min_confidence` (0..1) drops beats whose analysis confidence is below it, together with their subdivisions; it applies after `every`/`offset`, so bar counting stays on the full grid. `velocity` `confidence` uses each beat's confidence as the hit velocity instead of its onset strength. `notes init --from beats --min-conf X` fills a track the same way. |
+| `beats` | [`every` 1, `offset` 0, `subdivide` 1, `min_confidence` 0, `velocity` strength] | trigger, 1 ch | The **verified** beat grid from the analysis. Beats exist only where a real onset supports them. `offset` is an index offset into the beat list for `every`. `subdivide` inserts evenly spaced hits sized from the **previous** interval (causal), never past the next real beat. Subdivision velocity is 0.6 × the beat's. `min_confidence` (0..1) drops beats whose analysis confidence is below it, together with their subdivisions; it applies after `every`/`offset`, so bar counting stays on the full grid. `velocity` `confidence` uses each beat's confidence as the hit velocity instead of its onset strength. `notes init --from beats --min-conf X` fills a track the same way. `anchor` (`first` \| `bar`, default `first`): `first` counts `every`/`offset` along the beat list from its first beat (as before); `bar` counts on the bar grid, so `every: 4` = the downbeats, `every: 4, offset: 2` = the third beat of each bar, and `offset` is a phase in the bar, not a skip. The beat number is the analysis' bar position (`bar` x meter + `pos`, see Neural beats and bars), else the tempo map's beat count from the grid offset; a beat without an onset keeps its number, so counting never slips. With `subdivide` S, subdivision j of beat n counts as n·S + j. `notes init --from downbeats` = `every` meter, `anchor` `bar`. |
+| `drum` | `part` (`kick` \| `snare` \| `hats`), [`threshold` 0.3, `min_gap_ms` (kick 110, snare 90, hats 55), `source` auto] | trigger, 1 ch | One drum part's hits, with no band to tune: kick 35-120 Hz, snare (or clap) 1-5 kHz, hats 6-16 kHz, read from the separated drums stem when the analysis has it (`source` `auto`), else the mix; `stem` requires the stem, `mix` never reads it. On top of the band's onsets: a peak with 10x its power in the band within the next 120 ms is a stem's pre-echo and is dropped; a snare must still hold 2 % of its peak power 40-80 ms later (a kick's click is gone by then); a hat must hold 1 % 10-20 ms later (not a click), and one on a snare hit (within 25 ms) stays only when its rise is twice what the song's snares put in that band (hats that always land on the snare are left to the snare track). Then the strongest hits `min_gap_ms` apart, and `threshold` relative to the part's own 95th percentile. These tests look up to 80 ms past the onset (an offline choice, like `flash_limit` `strongest`); a hit still lands on the first frame at or after its onset. `notes init --from drum:kick`. |
 | `notes` | `track` | trigger, 1 ch | Hits from `notes.json`. Per-hit `len_beats` and `shape` travel with the trigger to `envelope`. |
 | `lfo` | [`shape` sine, `rate_beats` \| `rate_hz`, `phase` 0, `channels` 1, `phase_step` 0] | N ch, 0..1 | `rate_beats` = beats per cycle, locked to the tempo map and grid offset. `rate_hz` = cycles per second of audio time. Shapes: `sine` (starts at 0), `tri`, `saw_up`, `saw_down`, `square` (check warns: instant edges), `semi_sine`. Channel c gets `phase + c·phase_step`. Default rate: 1 beat. |
 | `const` | [`value` 0, `channels` 1] | N ch | |
@@ -175,6 +176,10 @@ Order of precedence: `rig.tempo.map` (frames), then `rig.tempo.bpm`, then the `n
 analysis bpm map, then 120. The grid offset comes from `rig.tempo.grid_offset`, then from notes (when notes carry a
 bpm map), then from the analysis. Beat positions are the integral of bpm/60 from the grid offset.
 
+With the neural tracker the analysis grid offset is the first downbeat's phase within a bar (in [0, bar)), so beats
+0, meter, 2·meter ... of the tempo map fall on downbeats: `lfo` `rate_beats` 4, patterns placed at multiples of 4 and
+bar windows line up with real bars. The classic grid's offset is a beat's phase (in [0, beat)).
+
 If the analysis finds **no proven pulse**, it reports the strongest window's folded period as a low-confidence tempo
 (`fallback: true`, flagged by `analyze`) and writes **no beats**. A `beats` op is then empty, while `lfo`/`*_beats`
 still run on that tempo. Set `rig.tempo.bpm` to override it.
@@ -186,9 +191,11 @@ that period) and a `confidence` relative to the best candidate (1.0 = best suppo
 automatically: a human or an agent picks one and pins it with `rig.tempo.bpm`.
 
 ## notes.json v0.2: sections and linked patterns
-- `sections: [{"name", "time"}]` (ordered). `beatrig notes sections init <rig>` fills them from the analysis: bar lines
-  (one-bar windows from the grid offset) where the band levels change sharply, the rule `describe_audio` uses. Names
-  are a guess from energy (`intro`, then `breakdown`, `main`, `peak`, numbered on repeats); edit them freely.
+- `sections: [{"name", "time"}]` (ordered). `beatrig notes sections init <rig>` fills them from the analysis with
+  `song_structure` (see Song structure below): labelled sections on bar lines (`intro`, `groove`, `dip`, `build`,
+  `breakdown`, `break`, `drop`, `outro`, numbered on repeats: `drop_2`). `--method energy` keeps the v0.2 rule (bar
+  lines where the band levels change sharply, names guessed from energy: `intro`, `breakdown`, `main`, `peak`).
+  `--min-bars` sets the shortest section. Edit the names freely.
 - `patterns: {"kick4": {"length_beats": 4, "hits": [{"beat": 0, "vel": 1}, ...]}}`, placed on a track with
   `{"pattern": "kick4", "at_beat": 16, "repeat": 4}`. `at_beat` counts on the notes' bpm map (120 bpm from
   `grid_offset` when the notes have none). Placements expand when notes are loaded and again whenever a rig is
@@ -256,15 +263,90 @@ each note's length. Imported hits are added to existing tracks unless `--replace
   range. The applier lands key frame f on sequence frame `start_frame` + f.
 
 ## Stems (optional extra: `pip install beatrig[stems]`)
-`beatrig stems <rig> [--device cuda|cpu]` separates drums/bass/vocals/other with htdemucs and caches them as wav next to
-the audio, in `<audio name>.stems/htdemucs-<content hash>/` (an edited file never reuses stale stems). Then
-`band`/`loudness`/`onsets` read a stem with `"stem": "drums"`; each stem has its own analysis cache in its folder.
-Separation is offline and looks at whole segments of audio; the analysis of a stem is causal as usual, but a stem can
-carry a little pre-echo, so check onset timing on your material. The core install never imports torch.
+Stems are used by default. `rig.analysis.stems`:
+- `auto` (the default): stems already separated are always used. A missing separation runs once, during `analyze`,
+  when the [stems] extra is installed and torch sees a CUDA GPU (about 5 s for a 4.5-minute track on an RTX 5090).
+  Without the extra, or on a CPU-only machine, stem features read the mix instead, and the analysis summary says so
+  and why (`beatrig analyze`, the MCP `analyze` tool, `Analysis.stems_label()`).
+- `on`: separate even on the CPU (slow: roughly the track's length or more).
+- `off`: never separate; drum parts and the song structure read the mix; nodes that name a `stem` still read a cached
+  one (and fail with what to run when it is missing).
+
+`beatrig stems <rig> [--device cuda|cpu]` separates by hand. htdemucs writes drums/bass/vocals/other as wav next to the
+audio, in `<audio name>.stems/htdemucs-<content hash>/` (an edited file never reuses stale stems). `band`/`loudness`/
+`onsets` read a stem with `"stem": "drums"`; `drum` reads the drums stem by itself. With stems in use, `analyze` opens
+all four (each with its own analysis cache, `<stem>.analysis/` in the stem folder) and computes the drum-part bands
+and each stem's level once, so drum parts and the song structure are cheap afterwards. A stem's analysis has no beat
+grid (its beats are never read). Separation is offline and looks at whole segments of audio; the analysis of a stem is
+causal as usual, but a stem carries a little pre-echo (about 90 ms ahead of a hit), which `drum` removes and plain
+`onsets` on a stem do not. The core install never imports torch.
+
+## Neural beats and bars (optional extra: `pip install beatrig[ml]`)
+`rig.analysis.beats`: `auto` (the default) uses the neural tracker when the [ml] extra is installed, else the classic
+grid, unchanged; `neural` requires it (an error otherwise); `classic` never uses it. The tracker is Beat This!
+(Foscarin, Schlueter and Widmer, ISMIR 2024; code and weights MIT): a transformer over a log-mel spectrogram that
+gives a beat and a downbeat probability every 20 ms. Its weights (77 MB) download once into the torch hub cache. It
+runs on the GPU when torch sees one, else on the CPU (measured: 1.4 s and 3 s for a 4.5-minute track, plus model
+loading). beatrig computes the spectrogram itself in numpy, so torchaudio is never imported.
+
+The model never places a beat. From its activations:
+1. **Beats.** Its beat peaks (logit > 0, the largest within ±60 ms, sub-frame by a parabola). Each needs a real onset:
+   the strongest octave-flux peak above the 70th percentile of the onset function and 5 % of a strong hit, within
+   0.14 periods of it. The beat is written at that onset's time ((k + 1) × 5 ms), never at the model's frame; a model
+   beat with no onset is not written. So beats exist only where an onset supports them and are never ahead of it.
+2. **Bars.** A skeleton of the model's beats (near-duplicates dropped, gaps of k periods filled with k − 1 virtual
+   beats, unsupported beats kept) carries the count. The meter is 3 when the model's downbeat spacings are clearly
+   multiples of 3, else 4. The phase is a Viterbi path over the downbeat activations (each beat's held to 0.1..0.9, a
+   phase change costing log 1e-12): a real shift is followed after about 7 bars of agreement, while a stretch where
+   the model hears the bar line elsewhere and comes back (syncopated chords in a drum-less breakdown) needs about 13
+   to break the count. Each written beat carries `bar` (0 = the first bar that starts with a downbeat; a pickup is −1)
+   and `pos` (0 = downbeat).
+3. **Passages and tempo.** Passages break where the model is silent for 8 beats or more or the local period moves
+   more than 3 %. Each is checked like a classic passage: tempo from a line fit through its beats, agreement with the
+   independent reference onsets above chance, confidence = mean model probability × hit rate × jitter × agreement;
+   one under `min_conf` or `min_agree` writes no beats. Beat confidence = the model's probability × an onset-strength
+   factor. If no passage passes (or the model fails, e.g. no network for the first download), the classic grid
+   stands and the analysis says why.
+
+The analysis keeps the activations (`nn:beat`, `nn:down` in analysis.npz) and records `beat_tracker` (`name`, `model`,
+`device`, `seconds`, or the classic grid's `why`), `bars` (`meter`, `downbeats` (times; an unsupported downbeat keeps
+the skeleton's time), `first_downbeat`, `confidence`) and, per beat, `bar` and `pos`. Tempo candidates are scored
+around the neural tempo. The tracker keeps its own metrical level: `bpm_min`/`bpm_max` fold only the classic grid.
+
+A cache built with the neural tracker is reused on a machine without the extra, so both bake alike. A classic cache
+built because the extra was missing (or disabled) is rebuilt once the extra is there. GPU inference is not
+bit-reproducible, but beats sit on the 5 ms onset grid, so a re-analysis moves a beat only when a model peak sits
+right at the 0.5 threshold; the cache is what keeps bakes byte-identical.
+
+`BEATRIG_EXTRAS=off` (environment) makes `auto` behave like a core install: no neural tracker and no automatic
+separation (cached stems are still read). The test suite sets it; it also reproduces a core install's analysis.
+
+## Song structure
+`beatrig.song_structure(analysis, min_bars=None)` (used by `notes sections init` and the MCP `describe_audio`) returns
+labelled sections on bar lines: `[{"name", "time", "bar", "label", "bars", "kick", "bass_db", "energy_db", "novelty"}]`.
+- **Bar lines**: the analysis' downbeats (extended by whole bars before and after), else bars of 4 beats from the grid
+  offset. A section time is a bar line, so a layer key naming it never fades before the music changes.
+- **Features per bar**: the mix level and each stem's level (dB under the song's loud bars, floored at −24 dB so that
+  "absent" is one value), kick / snare / hats hits per bar (`drum` parts, from the drums stem when there is one) and
+  the 7 band levels. Without stems, bass presence is the floor of the 50-250 Hz envelope between hits.
+- **Boundaries**: peaks of a contrast novelty (the distance between the mean features of the w bars before and after
+  a bar line, averaged over w = 2, 4, 8), with a 25 % bonus on the song's 8-bar phrase lines (the residue mod 8 with
+  the most novelty), kept where the robust z-score is at least 1.5, strongest first, at least `min_bars` apart
+  (default 8 in a song of 64 bars or more, 4 from 24, else 2). Kick or bass coming in or going out (for 2 bars or
+  more) is also a boundary, and so is the bar after a one-bar kick drop-out.
+- **Labels** from what plays: no kick = `breakdown` (`break` under 3 bars); kick without bass = `build` (`intro` when
+  first); kick and bass = `intro` (first), `drop` (after a build, breakdown or break, or right after a drop and at
+  least as loud), `build` (what rises, the other stem or else the mid bands, climbs 6 dB and a breakdown or a
+  bass-less part follows), `dip` (2 dB under the song's other full sections) or `groove`. The last section is `outro`
+  when it has no kick or is 3 dB under the full sections. Repeats are numbered.
+- Stems matter here: from the mix alone a pad or a sub-bass in a breakdown can pass for kick and bass.
 
 ## Additions to the design-doc formats (all optional)
-- rig: `notes` (path to the notes file, default `notes.json`), `analysis` (settings: `bpm_min` 75, `bpm_max` 150 (tempo is folded into this range),
-  `pulse_z` 4, `min_conf` 0.15, `min_agree` 0.15, `win_s` 16, `hop_s` 4; clips under 32 s use `win_s` = duration/2 (min 4 s)), `tempo.grid_offset`, `bake.decimals` (4).
+- rig: `notes` (path to the notes file, default `notes.json`), `analysis` (settings: `bpm_min` 75, `bpm_max` 150 (the classic
+  tempo is folded into this range), `pulse_z` 4, `min_conf` 0.15, `min_agree` 0.15, `win_s` 16, `hop_s` 4 (clips under
+  32 s use `win_s` = duration/2, min 4 s), `beats` auto|neural|classic, `stems` auto|on|off; all but `stems` are part
+  of the cache key), `tempo.grid_offset`, `bake.decimals` (4).
+- analysis.json (version 5): `beat_tracker`, and with the neural tracker `bars` and per beat `bar`/`pos` (above).
 - bake.json: `audio_offset_frames`, `notes_hash`, and per output `layer` and `signal`. MPC channels carry no `actor`.
   Values are rounded to `bake.decimals`. Keys are `[frame, value]` taken from those values, and their
   linear-interpolation error is at most `key_tolerance · |max − min|`.
@@ -299,7 +381,9 @@ notes = beatrig.load_notes(path); beatrig.save_notes(path, notes)
 an.summary(px_per_s=200)                         # waveform peaks, beats, bpm map, passages, tempo_candidates
 an.meta["tempo_candidates"]                      # [{"ratio", "bpm", "support", "confidence"}]
 beatrig.flash_report(values, fps, lo, hi, 3, 0.1)              # per-second flash counts + offending windows
-secs, levels = beatrig.section_boundaries(an); beatrig.name_sections(secs)
+secs, levels = beatrig.section_boundaries(an); beatrig.name_sections(secs)   # the v0.2 energy rule
+beatrig.song_structure(an)                       # labelled sections on bar lines
+an.tracker_label(); an.bars_summary(); an.stems_label(); an.stems["drums"]   # where beats, bars and stem features came from
 beatrig.make_pattern(notes, "kick4", 4, hits=[{"beat": 0, "vel": 1}]); beatrig.place_pattern(notes, "kick", "kick4", 16, 4)
 beatrig.track_hits(notes, "kick")                # plain + freshly expanded pattern hits
 beatrig.import_midi("drums.mid", "36:kick,38:snare", channel=10)    # {"bpm_map", "grid_offset", "tracks", "stats"}

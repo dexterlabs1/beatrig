@@ -1142,8 +1142,8 @@ def _bar_floor_db(env, edges, dur, pct=20):
 
 def bar_features(a, edges):
     """per bar: {"mix", stem names (dB re the loud bars), "kick"/"snare"/"hats" (hits per bar, from the drums stem
-    when there is one), "bands" ([7, bars] SECTION_BANDS levels 0..1), "rise" (dB of what builds up: the other stem,
-    else the mid bands)}"""
+    when there is one), "bands" ([7, bars] SECTION_BANDS levels 0..1), "bass" (the bass stem, else the floor of the
+    50-250 Hz envelope between hits), "rise" (dB of what builds up: the other stem, else the mid bands)}"""
     from .drums import part_hits
     dur = float(a.meta["duration"])
     a.ensure([("loud", None, None, None)])
