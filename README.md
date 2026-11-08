@@ -284,7 +284,7 @@ at runtime from tick time can't promise that.
 
 ## Status
 
-v0.3.0, plus the unreleased additions in the changelog. The test suite (162 tests) passes on Windows with Python 3.11
+v0.3.0, plus the unreleased additions in the changelog. The test suite (166 tests) passes on Windows with Python 3.11
 with every extra installed and a CUDA GPU; CI runs it on Ubuntu and Windows with Python 3.11 and 3.12 (core only, so
 the GPU and real-model tests skip). The CLI, preview page, MCP server and live link have been run by hand on Windows against UE 5.8.3.
 
