@@ -2493,7 +2493,7 @@ async function loadCurves() {
       for (const cv of document.querySelectorAll(kind === "o" ? 'canvas[data-kind="curve"]' : 'canvas[data-kind="band"]')) if (cv.dataset.id === id) schedule(cv);
     } catch (e) { msg(`curves ${k.slice(2)}: ${e.message}`, true); }
   }));
-  if (gen === curveGen) { drawSchem(); markReady(); }
+  if (gen === curveGen) { P3.meterF = null; drawSchem(); markReady(); }   // meters drawn before the curves landed redraw
 }
 // data ready = state, every curve and the waveform are in memory (first paint = this + one full redraw)
 function markReady() {
