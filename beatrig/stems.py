@@ -45,9 +45,10 @@ def stem_dir(audio, digest=None, model=MODEL):
     return os.path.join(base + ".stems", f"{model}-{digest[:16]}")
 
 
-def cached(audio, model=MODEL):
-    """{stem: wav path} when this audio's stems exist, else None. Hashes the file (about 1 s per GB)."""
-    d = stem_dir(audio, model=model)
+def cached(audio, model=MODEL, digest=None):
+    """{stem: wav path} when this audio's stems exist, else None. Hashes the file (about 1 s per GB) unless its
+    sha256 is given."""
+    d = stem_dir(audio, digest, model=model)
     paths = {s: os.path.join(d, s + ".wav") for s in STEMS}
     return paths if all(os.path.exists(p) for p in paths.values()) else None
 

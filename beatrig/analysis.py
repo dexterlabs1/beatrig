@@ -764,6 +764,15 @@ class Analysis:
         self.loaded_from_cache = False
         self.stems, self.stems_info = {}, {"used": False, "why": "not requested"}   # set by bake.analyze()
 
+    def content_hash(self):
+        """sha256 of the audio file (it names the stem folder), kept in the cache so a cached analyze never re-reads a
+        long show to find its stems"""
+        if not self.meta.get("content_sha256"):
+            from .stems import content_hash
+            self.meta["content_sha256"] = content_hash(self.audio)
+            self.dirty = True
+        return self.meta["content_sha256"]
+
     def tracker(self):
         """(name, why) the beat grid comes from with these settings on this install: "neural" or "classic". "auto" is
         neural when the [ml] extra is installed (and BEATRIG_EXTRAS is not "off")."""

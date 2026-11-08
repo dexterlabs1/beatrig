@@ -85,7 +85,7 @@ def open_stems(rig: Rig, a: Optional[Analysis] = None, use_cache: bool = True):
     from . import stems as S
     mode = _stem_mode(a, rig)
     names = set(S.used_stems(rig.nodes))
-    paths = S.cached(rig.audio_path)
+    paths = S.cached(rig.audio_path, digest=a.content_hash() if a is not None else None)
     why = ""
     if paths is None:
         if mode == "off":
