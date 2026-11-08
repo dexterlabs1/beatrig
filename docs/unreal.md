@@ -306,8 +306,9 @@ base record; the base itself was never changed (see Output blend above).
 
 ## Playhead
 
-`playhead_get()` returns the sequence open in Sequencer, the playhead in display frames, whether it is playing, its fps
-and playback range (`sequence: null` when nothing is open). `playhead_set(frame, playing, sequence)` jumps the playhead
+`playhead_get()` returns the sequence open in Sequencer, the playhead in display frames, whether it is playing, its fps,
+playback range and `audio` (the sequence has an active audio track; `sequence: null` when nothing is open). A linked
+preview page mutes its own audio while `audio` is true, so the music isn't heard twice. `playhead_set(frame, playing, sequence)` jumps the playhead
 (no events fire in between) and plays or pauses; with `sequence` it first opens that sequence in Sequencer, which
 replaces whatever Sequencer was showing.
 

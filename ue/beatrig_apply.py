@@ -1050,7 +1050,18 @@ def playhead_get():
         return {"ok": True, "sequence": None, "frame": None, "playing": False}
     r = seq.get_display_rate()
     return {"ok": True, "sequence": _pkg(seq), "frame": _position(), "playing": bool(L.is_playing()),
-            "fps": r.numerator / r.denominator, "range": [seq.get_playback_start(), seq.get_playback_end()]}
+            "fps": r.numerator / r.denominator, "range": [seq.get_playback_start(), seq.get_playback_end()],
+            "audio": _has_audio(seq)}
+
+
+def _has_audio(seq):
+    """True when the sequence plays sound itself (an audio track with an active section), so a linked page should
+    stay quiet instead of doubling the music"""
+    for t in seq.get_tracks():
+        if isinstance(t, unreal.MovieSceneAudioTrack):
+            if any(s.is_active() for s in t.get_sections()):
+                return True
+    return False
 
 
 def playhead_set(frame=None, playing=None, sequence=None):

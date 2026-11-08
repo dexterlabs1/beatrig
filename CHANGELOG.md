@@ -3,6 +3,12 @@
 All notable changes to beatrig. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- Preview page: with the playhead linked to a sequence that has its own audio track, the page mutes itself, so the
+  music isn't heard twice. `playhead_get` reports `audio`.
+
 ## [0.3.0] - 2026-11-07
 
 Audio-reactive gains on top of a show's existing keys, without touching them.

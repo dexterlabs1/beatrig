@@ -2268,6 +2268,11 @@ function applyLive(st) {
   if (!st) return;
   S.live = st;
   S.link = !!st.link_playhead;
+  syncMute();
+  if (S.link && S.editorAudio == null && !S.audioProbe) {      // linked already (a reload): ask the editor once
+    S.audioProbe = true;
+    api("/api/playhead").then(editorAudio, () => {}).finally(() => { S.audioProbe = false; });
+  }
   $("#live").classList.toggle("on", !!st.enabled);
   $("#link").classList.toggle("on", S.link);
   const seq = $("#live-seq");
@@ -2302,6 +2307,17 @@ $("#link").onclick = async () => {
     msg(S.link ? "playhead linked: playing here drives the editor; paused, this page follows it" : "playhead unlinked");
   } catch (e) { msg("link: " + e.message, true); }
 };
+// Linked to a sequence that plays the music itself (an audio track): this page goes quiet while linked, so the song
+// isn't heard twice. Unlinking, or a sequence without audio, gives the page its sound back.
+function editorAudio(d) {
+  if (!d || d.audio == null) return;
+  if (S.live.sequence && d.sequence && d.sequence.split(".")[0] !== S.live.sequence.split(".")[0]) return;
+  const was = !!S.editorAudio;
+  S.editorAudio = !!d.audio;
+  syncMute();
+  if (S.link && S.editorAudio && !was) msg("the sequence plays the music: page audio muted while linked");
+}
+function syncMute() { audio.muted = !!(S.link && S.editorAudio); }
 let phBusy = false, phNext = null;
 function pushPlayhead() {
   if (!S.link) return;
@@ -2310,13 +2326,14 @@ function pushPlayhead() {
   if (phBusy) return;
   const send = async () => {
     const body = phNext; phNext = null; phBusy = true;
-    try { await api("/api/playhead", body); } catch (e) { msg("playhead: " + e.message, true); }
+    try { editorAudio(await api("/api/playhead", body)); } catch (e) { msg("playhead: " + e.message, true); }
     phBusy = false;
     if (phNext) send();
   };
   send();
 }
 function onEditorPlayhead(d) {
+  if (S.link) editorAudio(d);
   if (!S.link || !audio.paused || d == null || d.frame == null) return;
   if (S.live.sequence && d.sequence && d.sequence !== S.live.sequence) return;    // another sequence is open: ignore it
   if (performance.now() - S.lastPagePush < 600) return;

@@ -435,7 +435,7 @@ class Live:
             try:
                 ph = self.call("playhead_get")
                 ph = jsonable(ph) if isinstance(ph, dict) else {"frame": jsonable(ph)}
-                key = (ph.get("frame"), ph.get("playing"))
+                key = (ph.get("frame"), ph.get("playing"), ph.get("audio"))
                 if key != last:
                     last = key
                     self.editor = ph
