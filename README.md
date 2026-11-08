@@ -10,8 +10,7 @@ ordinary Sequencer keys, so nothing has to be installed at render time and there
 be driven by an agent as well as by a person: there's a CLI, the files are hand-editable JSON, and an MCP server
 covers the whole loop from analysing the song to writing keys into Unreal. With the live link on, an edit lands in
 the Unreal viewport about a tenth of a second later.
-![The preview page: sections, waveform and beat grid, note lanes with linked patterns, layer fades, per-channel light curves and colour strips, and the ring, plan and dome previews](docs/img/preview.png)
-![The preview page: waveform and beat grid, note lanes, per-channel curves and a ring of lights](docs/img/preview.png)
+![The preview page: sections, waveform and beat grid, note lanes with linked patterns, layer fades, per-channel light curves and colour strips, the graph panel, and the 3D preview of the scanned scene with a meter per output](docs/img/preview.png)
 
 ## Three ways in
 
@@ -162,6 +161,27 @@ The rules every op follows (causal, eased, deterministic), every op's params and
 **[ops reference](docs/ops.md)**. The file formats (`rig.json`, `notes.json`, `bake.json`) and the reasoning behind
 them are in the [design doc](docs/design.md).
 
+## The preview page
+
+`beatrig serve` opens one page for the whole loop: the song's sections, waveform, beat grid and bands; the note lanes
+(click adds a hit, drag moves it, drag up or down sets its velocity; linked patterns; tap-record on keys 1-9); the
+layer fades; a lane per output with its baked curves or colour strips and any flash-safety windows; and a graph panel
+with a slider for every numeric parameter (releasing one re-bakes). `?` lists the keys.
+
+The **Preview** panel draws the scanned scene (`scene.json`) in 3D at the playhead, from the baked values. Lights glow
+in their colour with a pool of light on the floor, spot lights throw a beam, material- and Niagara-driven meshes glow,
+transform outputs move, turn and scale them, and MPC outputs lift the ambient light; the picture is drawn in linear
+light with bloom and fog. Three modes: **Orbit** (drag to turn, right-drag or Shift+drag to pan, wheel to zoom,
+double-click to frame), **Camera** (through the scene camera) and **Dome** (the domemaster from the dome camera,
+below). Hover an actor to read what drives it; a meter row per output sits under the view. It is plain WebGL2, no
+libraries; without WebGL2 (or with `?gl=0`) the 2D ring, plan and dome views stand in.
+
+The button beside the modes opens the preview in **its own window** (`/preview`), for a second monitor. It follows the
+page's playhead and every edit; its Space, arrow keys and scrub bar drive the page, which plays the audio, so the song
+is never heard twice. Opened on its own it plays silently. While it is open, the page folds its own preview away.
+
+![The pop-out preview window: the scene in orbit mode with two spot-light beams, the ring of lights and the meters](docs/img/popout.png)
+
 ## Unreal integration
 
 `ue/beatrig_apply.py` runs inside the Unreal editor (UE 5.x, Python Editor Script Plugin) and writes a bake into a
@@ -230,7 +250,7 @@ parameters, MPCs and the dome camera.
 
 Keep live rigs short (a scene, not a whole show): writing keys costs about 16 microseconds per key in the editor.
 
-The page's **Dome** view draws the scanned actors where they land on a domemaster from the scene's dome camera
+The preview's **Dome** mode draws the scanned actors where they land on a domemaster from the scene's dome camera
 (including its tilt), lit by their channels, so a `dome_wave` reads the way it will on the dome:
 
 <img src="docs/img/dome.png" alt="Dome view: lights placed on the dome master from a tilted dome camera" width="340">
@@ -251,7 +271,7 @@ v0.3.0. The test suite (134 tests) passes on Windows with Python 3.14; CI runs i
 |---|---|
 | Analysis, ops, notes, layers, bake, `check` | Tested: pytest suite (determinism, causality, op maths, notes round-trip, key simplification); the ring demo bakes byte-identically run to run |
 | CLI | Run by hand on the ring demo |
-| Preview page | Checked by hand in a browser |
+| Preview page | Checked in a browser. The 3D modes, the 2D fallback and the pop-out window's sync with the page (play, pause, seek, edits) were driven in headless Chrome over DevTools; a server test checks that every page file is served and packaged |
 | MCP server | Run end to end over stdio with the MCP Python SDK client (list tools, analyze, describe_audio, rig and notes edits, bake, plot, preview notify); no automated test yet |
 | `ue/keys.py` (tick maths, key planning, undo tags) | Tested: pytest |
 | `ue/beatrig_apply.py` (the in-editor applier) | Tested live in UE 5.8.3 for every target kind (scalar, colour, transform, Niagara) and for `multiply`/`add` blends on MPC, light and material targets: apply, key-for-key `check`, re-apply in place, `undo` including bindings. Transform and colour values were read back off the actors at the playhead |

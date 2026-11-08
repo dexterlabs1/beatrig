@@ -144,8 +144,20 @@ v0 shipped a JSON-only, polling page; v0.2 replaced the transport (see "Server e
   There is no polling.
 - `POST /api/rig`, `/api/notes`, `/api/edit` re-bake in memory; `POST /api/save` writes to disk with a `.bak`.
   `/api/live`, `/api/playhead`, `/api/scan` drive `beatrig.live.Link`.
-- Plain HTML/JS/CSS, Canvas 2D, no build step. Measured on a 60-minute rig: first paint 0.4-0.7 s, a full redraw
-  6.2 ms or less, `/api/state` 0.24 MB (it was 14 MB as JSON).
+- `GET /preview` serves the same page as a view-only pop-out window (the 3D preview alone, for a second monitor). It
+  follows the main page over a BroadcastChannel (time and play state on play, pause and seek, every 250 ms while
+  playing; it extrapolates in between) and edits over `/api/events`; its transport drives the main page, which owns
+  the audio. It never plays audio and never writes (no edits, no save, no editor playhead or scan).
+- Plain HTML/JS/CSS, no build step. The lanes are Canvas 2D: they measured well inside budget, so WebGL would buy them
+  nothing. The scene preview is WebGL2 (`web/preview3d.js`, no libraries): it needs depth, additive light, bloom and a
+  frame on every display refresh while playing. It is drawn in linear light into a multisampled half-float buffer
+  (supersampled when the screen isn't high-DPI), bloomed, tone-mapped (1 - e^-x) and sRGB-encoded. The dome mode
+  places actors with the same projection as the 2D dome view (`domeProjectTo`, equal to `beatrig.spatial.dome_angles`),
+  so there is one implementation of the domemaster convention. Without WebGL2 the 2D ring, plan and dome views stay.
+- Measured on a synthetic 60-minute rig (32 lights with intensity and colour, an MPC, a 33-actor scene; headless
+  Chrome 157): first paint 0.38-0.48 s, a full redraw at fit 2.4-2.9 ms, a 60 s view 1.8-2.4 ms, a playback frame
+  0.1 ms p50 (the 3D preview's share 0.3 ms p50), `/api/state` 0.24 MB (it was 14 MB as JSON). The WebGL2 draw
+  (evaluate, fill, scene, bloom, tone map) allocates nothing: 1.5 bytes per frame over 4,000 draws, i.e. noise.
 
 ## Unreal applier (`ue/beatrig_apply.py`, runs inside the editor)
 Reads bake.json and writes keys into a Level Sequence, on tracks named `beatrig:<output id>[:<actor>]` and bindings

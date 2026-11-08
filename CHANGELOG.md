@@ -9,6 +9,23 @@ project uses [semantic versioning](https://semver.org/).
 - `normalize` `ref_db` / `floor_db`: a fixed level scale instead of the bake's own percentiles, so a louder mix
   drives harder. `beatrig pin-levels <rig>` writes each node's current top and floor (the bake on that audio is
   unchanged).
+- Preview page: a **3D preview** of the scanned scene (plain WebGL2, no libraries), drawn from the baked values at the
+  playhead. Lights glow in their colour with a pool of light on the floor, spot lights throw a soft beam along their
+  forward axis, material- and Niagara-driven meshes glow, transform outputs move, turn and scale them, and MPC outputs
+  lift the ambient light, in linear light with bloom, fog and supersampling. Modes: orbit (drag, right/Shift-drag,
+  wheel, double-click frames), camera (through `scene.camera`) and dome (the domemaster, same projection as before).
+  Hover an actor to read what drives it; a meter row per output sits under the view. Without WebGL2, or with `?gl=0`,
+  the 2D ring, plan and dome views stay. Spot cone angles come from `outer_cone_angle` / `cone_angle` on a scene
+  component when present (the scan doesn't record them yet), else Unreal's default 44 degrees.
+- Preview page: a **pop-out preview window** (`/preview`, the button beside the preview modes) for a second monitor. It
+  follows the page's playhead and edits; its transport drives the page, which plays the audio, so nothing is heard
+  twice. On its own it plays silently. The page folds its own preview away while one is open.
+
+### Changed
+- Preview page: refined UI. A grouped transport with an m:ss.mmm timecode, a type scale on the system UI font with
+  tabular figures, 4/8 px spacing, readable lane heads, node cards in the graph panel, keyboard keys in the help, and
+  clear empty, offline and load-failure states with a connection indicator. The canvases take their colours and font
+  from the CSS tokens.
 
 ### Fixed
 - Preview page: with the playhead linked to a sequence that has its own audio track, the page mutes itself, so the
